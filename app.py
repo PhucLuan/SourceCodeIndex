@@ -20,7 +20,7 @@ def save_sources(sources):
     with open(SOURCES_FILE, "w") as f:
         json.dump(sources, f)
 
-def sync_workspace():
+def sync_workspace(includes_list, excludes_list):
     sources = load_sources()
     if os.path.exists(WORKSPACE_DIR):
         shutil.rmtree(WORKSPACE_DIR)
@@ -34,12 +34,36 @@ def sync_workspace():
             
         if os.path.exists(src):
             basename = os.path.basename(src.rstrip("/"))
-            dst = os.path.join(WORKSPACE_DIR, basename)
-            if not os.path.exists(dst):
+            dst_root = os.path.join(WORKSPACE_DIR, basename)
+            
+            if os.path.isdir(src):
+                for root, dirs, files in os.walk(src):
+                    # Lọc loại bỏ thư mục
+                    if excludes_list:
+                        dirs[:] = [d for d in dirs if d not in excludes_list]
+                        
+                    for file in files:
+                        ext = os.path.splitext(file)[1].lower()
+                        # Loại bỏ nếu include_list không trống và đuôi không khớp
+                        if includes_list and ext not in includes_list:
+                            continue
+                            
+                        file_src_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(file_src_path, src)
+                        file_dst_path = os.path.join(dst_root, rel_path)
+                        
+                        os.makedirs(os.path.dirname(file_dst_path), exist_ok=True)
+                        try:
+                            os.symlink(file_src_path, file_dst_path, target_is_directory=False)
+                        except:
+                            pass
+            else:
+                # Nếu source thêm vào là 1 file độc lập
+                os.makedirs(dst_root, exist_ok=True)
                 try:
-                    os.symlink(src, dst, target_is_directory=os.path.isdir(src))
-                except Exception as e:
-                    st.error(f"Error linking {src}: {str(e)}")
+                    os.symlink(src, os.path.join(dst_root, basename), target_is_directory=False)
+                except:
+                    pass
         else:
             st.error(f"Không thể truy cập đường dẫn (kể cả sau đổi): {src}. Đảm bảo bạn đã Mount ổ đĩa đó.")
 
@@ -70,18 +94,50 @@ with st.sidebar:
             save_sources(sources)
             st.rerun()
 
-    if st.button("🔄 Cập nhật Index", use_container_width=True, type="primary"):
+    st.write("---")
+    st.subheader("Cấu hình Lọc File & Thư mục")
+    file_extensions = st.text_input("Đuôi file cần Index (cách nhau bởi dấu phẩy, chữ 'all' để lấy tất cả):", value="all")
+    exclude_folders = st.text_input("Loại trừ các thư mục (cách nhau dấu phẩy):", value="bin, obj, .vs, node_modules, .git")
+    
+    st.write("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        btn_update = st.button("🔄 Cập nhật Index", use_container_width=True, type="primary")
+    with col2:
+        btn_reindex = st.button("🗑️ Index lại (Reset)", use_container_width=True)
+        
+    if btn_update or btn_reindex:
         with st.spinner("Đang chạy quá trình Indexing (có thể mất nhiều phút)..."):
-            sync_workspace()
+            
+            # Tiền xử lý inputs filtering
+            includes_list = [x.strip().lower() for x in file_extensions.split(",") if x.strip()]
+            if "all" in includes_list:
+                includes_list = []
+            else:
+                # Đảm bảo có bắt đầu bằng dấu chấm
+                includes_list = [x if x.startswith('.') else f".{x}" for x in includes_list]
+                
+            excludes_list = [x.strip() for x in exclude_folders.split(",") if x.strip()]
+
+            sync_workspace(includes_list, excludes_list)
+            
             # Goi cocoindex update
             try:
                 env = os.environ.copy()
+                
+                cmd_args = ["cocoindex", "update", "indexer_flow", "--force"]
+                if btn_reindex:
+                    cmd_args.append("--reset")
+                    
                 result = subprocess.run(
-                    ["cocoindex", "update", "indexer_flow", "--force"],
+                    cmd_args,
                     capture_output=True, text=True, env=env
                 )
                 if result.returncode == 0:
-                    st.success("Cập nhật Index thành công!")
+                    if btn_reindex:
+                        st.success("Đã xoá DB cũ và tạo lại Index thành công!")
+                    else:
+                        st.success("Cập nhật Index thành công!")
                 else:
                     st.error(f"Lỗi index: {result.stderr}")
             except Exception as e:
