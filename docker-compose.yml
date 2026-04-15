@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  pgvector:
+    image: ankane/pgvector:latest
+    environment:
+      POSTGRES_USER: cocoindex
+      POSTGRES_PASSWORD: cocoindex_password
+      POSTGRES_DB: cocoindex_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+    restart: always
+
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/app
+      - /c:/host_c
+      - huggingface_cache:/root/.cache/huggingface
+    environment:
+      - COCOINDEX_DATABASE_URL=postgresql://cocoindex:cocoindex_password@pgvector:5432/cocoindex_db
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    depends_on:
+      - pgvector
+
+volumes:
+  pgvector_data:
+  huggingface_cache:

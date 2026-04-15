@@ -1,0 +1,23 @@
+# Task Checklist
+
+- `[/]` 1. Khởi tạo cấu trúc dự án.
+  - `[ ]` Tạo `docker-compose.yml` cấu hình PostgreSQL + pgvector.
+  - `[ ]` Tạo `requirements.txt` các dependency cần thiết.
+- `[ ]` 2. Xây dựng module Indexing (`indexer.py`).
+  - `[ ]` Cấu hình đọc danh sách source từ `sources.json` (do UI quản lý).
+  - `[ ]` Định nghĩa CocoIndex flow (`@cocoindex.flow_def`).
+  - `[ ]` Chia chunk file (`SplitRecursively`).
+  - `[ ]` Sinh embedding (sử dụng local model như sentence-transformers).
+  - `[ ]` Lưu vector vào database PostgreSQL.
+- `[ ]` 3. Xây dựng module LLM & Query (`rag.py` / `query.py`).
+  - `[ ]` Hàm query pgvector lấy chunks tương đồng.
+  - `[ ]` Factory khởi tạo LLM tuỳ chọn (Ollama mặc định, OpenAI, Gemini).
+  - `[ ]` RAG chain kết hợp context và query.
+- `[ ]` 4. Xây dựng giao diện UI (`app.py`).
+  - `[ ]` Sidebar: Cấu hình LLM & API Key.
+  - `[ ]` Sidebar: Thêm/Xoá thư mục nguồn `sources.json`.
+  - `[ ]` Sidebar: Nút "Cập nhật Index" để trigger `cocoindex update`.
+  - `[ ]` Body: Giao diện Chatbot.
+- `[ ]` 5. Kiểm tra và xác nhận hệ thống.
+  - `[ ]` Test backend db với docker.
+  - `[ ]` Trình bày Walkthrough báo cáo kêt quả cho người dùng.

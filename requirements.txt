@@ -1,0 +1,9 @@
+streamlit
+cocoindex
+langchain
+langchain-community
+langchain-openai
+langchain-google-genai
+psycopg2-binary
+sentence-transformers
+torchvision
