@@ -3,7 +3,7 @@ import json
 import os
 import shutil
 import subprocess
-from rag import query_cocoindex_db, get_llm, generate_answer
+from rag import query_cocoindex_db, get_llm, generate_answer_stream
 
 st.set_page_config(page_title="Source Code Indexer", page_icon="🔍", layout="wide")
 
@@ -187,12 +187,9 @@ if query := st.chat_input("Nhập câu hỏi liên quan tới codebase..."):
             else:
                 try:
                     llm = get_llm(llm_choice, model_name=model_name, api_key=api_key, ollama_host=ollama_host)
-                    result = generate_answer(query, docs, llm)
+                    stream_generator = generate_answer_stream(query, docs, llm)
                     
-                    # Usually chain invoke returns varying types, if it's standard BaseMessage it stringifies it
-                    response = result.content if hasattr(result, "content") else str(result)
-                    
-                    st.markdown(response)
+                    response = st.write_stream(stream_generator)
                     st.session_state.messages.append({"role": "assistant", "content": response})
                     
                     with st.expander("Nguồn trích dẫn (Context Used)"):

@@ -7,16 +7,20 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 
-# Load Local Embeddings model (the same one used in indexer_flow.py)
-embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+import streamlit as st
 
-def query_cocoindex_db(query_text, top_k=10):
+@st.cache_resource
+def get_embedding_model():
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+def query_cocoindex_db(query_text, top_k=5):
     """
     Search vector similarity against the table populated by CocoIndex.
     """
     db_uri = os.environ.get("COCOINDEX_DATABASE_URL", "postgresql://cocoindex:cocoindex_password@localhost:5432/cocoindex_db")
     
     # 1. Generate query embedding
+    embedding_model = get_embedding_model()
     query_vec = embedding_model.encode(query_text).tolist()
     
     conn = None
@@ -30,7 +34,7 @@ def query_cocoindex_db(query_text, top_k=10):
             """
             SELECT filename, lang, text 
             FROM code_embeddings_table 
-            ORDER BY embedding <-> %s::vector 
+            ORDER BY embedding <=> %s::vector 
             LIMIT %s;
             """,
             (query_vec, top_k)
@@ -64,9 +68,9 @@ def get_llm(llm_choice, model_name="llama-local", api_key=None, ollama_host=None
     else:
         raise ValueError("Unknown LLM choice")
 
-def generate_answer(query_text, docs, llm):
+def generate_answer_stream(query_text, docs, llm):
     """
-    Generate an answer based on retrieved documents.
+    Generate an answer using Streaming approach for smoother UI.
     """
     prompt_template = """
 Bạn là một kỹ sư phần mềm cấp cao hỗ trợ trả lời các câu hỏi về chuyên môn code. Dưới đây là các đoạn mã nguồn và tài liệu liên quan được trích xuất từ codebase hiện tại:
@@ -88,4 +92,8 @@ Chuyên gia trả lời:"""
     
     chain = prompt | llm
     
-    return chain.invoke({"context": context_str, "question": query_text})
+    for chunk in chain.stream({"context": context_str, "question": query_text}):
+        if hasattr(chunk, "content"):
+            yield chunk.content
+        else:
+            yield str(chunk)
