@@ -3,7 +3,17 @@ import json
 import os
 import shutil
 import subprocess
+import cocoindex
 from rag import query_cocoindex_db, get_llm, generate_answer_stream
+
+# Khởi tạo CocoIndex runtime một lần duy nhất khi app khởi động.
+# Bắt buộc để query_handler (search) đã đăng ký trong indexer_flow có thể hoạt động.
+@st.cache_resource
+def _init_cocoindex():
+    cocoindex.init()
+    return True
+
+_init_cocoindex()
 
 st.set_page_config(page_title="Source Code Indexer", page_icon="🔍", layout="wide")
 

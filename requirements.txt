@@ -1,9 +1,12 @@
 streamlit
 cocoindex
+# psycopg v3 + pool + pgvector (theo pattern chính thức của CocoIndex code_embedding example)
+psycopg[pool,binary]
+pgvector
+# Langchain
 langchain
 langchain-community
 langchain-openai
 langchain-google-genai
-psycopg2-binary
+# Embedding model (vẫn cần để SentenceTransformerEmbed của CocoIndex hoạt động)
 sentence-transformers
-torchvision

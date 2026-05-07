@@ -1,61 +1,44 @@
 import os
-import psycopg2
-from sentence_transformers import SentenceTransformer
 from langchain_core.documents import Document
 from langchain_community.llms.ollama import Ollama
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 
+import cocoindex
 import streamlit as st
 
-@st.cache_resource
-def get_embedding_model():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+# Import search handler và flow đã được đăng ký trong indexer_flow.
+# CocoIndex sẽ init và quản lý connection pool bên trong.
+from indexer_flow import search as _cocoindex_search
 
-def query_cocoindex_db(query_text, top_k=5):
+
+def query_cocoindex_db(query_text: str, top_k: int = 5) -> list[Document]:
     """
-    Search vector similarity against the table populated by CocoIndex.
+    Semantic search dùng built-in CocoIndex query handler.
+    Không cần viết SQL hay quản lý embedding model thủ công.
     """
-    db_uri = os.environ.get("COCOINDEX_DATABASE_URL", "postgresql://cocoindex:cocoindex_password@localhost:5432/cocoindex_db")
-    
-    # 1. Generate query embedding
-    embedding_model = get_embedding_model()
-    query_vec = embedding_model.encode(query_text).tolist()
-    
-    conn = None
     try:
-        # 2. Connect to Database
-        conn = psycopg2.connect(db_uri)
-        cur = conn.cursor()
-        
-        # 3. Query pgvector using L2 distance <-> operator
-        cur.execute(
-            """
-            SELECT filename, lang, text 
-            FROM code_embeddings_table 
-            ORDER BY embedding <=> %s::vector 
-            LIMIT %s;
-            """,
-            (query_vec, top_k)
-        )
-        rows = cur.fetchall()
-        
+        # Gọi thẳng CocoIndex search handler đã khai báo với @code_embedding_flow.query_handler()
+        # Hàm này tự embed query bằng code_to_embedding.eval() rồi query pgvector
+        query_output = _cocoindex_search(query_text)
+
         docs = []
-        for row in rows:
-            filename, lang, text = row
+        for result in query_output.results[:top_k]:
             docs.append(Document(
-                page_content=text,
-                metadata={"filename": filename, "lang": lang}
+                page_content=result["text"],
+                metadata={
+                    "filename": result["filename"],
+                    "lang":     result["lang"],
+                    "score":    result["score"],
+                }
             ))
         return docs
+
     except Exception as e:
-        print(f"Error querying db: {e}")
+        st.error(f"Lỗi khi query CocoIndex: {e}")
         return []
-    finally:
-        if conn:
-            cur.close()
-            conn.close()
+
 
 def get_llm(llm_choice, model_name="llama-local", api_key=None, ollama_host=None):
     if llm_choice == "Ollama":
@@ -67,6 +50,7 @@ def get_llm(llm_choice, model_name="llama-local", api_key=None, ollama_host=None
         return ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=api_key)
     else:
         raise ValueError("Unknown LLM choice")
+
 
 def generate_answer_stream(query_text, docs, llm):
     """
@@ -86,12 +70,14 @@ Câu hỏi: {question}
 Chuyên gia trả lời:"""
 
     prompt = PromptTemplate.from_template(prompt_template)
-    
-    # Gộp context thành một string
-    context_str = "\n\n".join([f"--- File: {d.metadata.get('filename')} ---\n{d.page_content}" for d in docs])
-    
+
+    context_str = "\n\n".join([
+        f"--- File: {d.metadata.get('filename')} (score: {d.metadata.get('score', 0):.3f}) ---\n{d.page_content}"
+        for d in docs
+    ])
+
     chain = prompt | llm
-    
+
     for chunk in chain.stream({"context": context_str, "question": query_text}):
         if hasattr(chunk, "content"):
             yield chunk.content
