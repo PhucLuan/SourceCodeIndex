@@ -20,9 +20,11 @@ services:
     volumes:
       - .:/app
       - /c:/host_c
+      - /d:/host_d
       - huggingface_cache:/root/.cache/huggingface
     environment:
       - COCOINDEX_DATABASE_URL=postgresql://cocoindex:cocoindex_password@pgvector:5432/cocoindex_db
+      - COCOINDEX_DB=/app/cocoindex.db
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
     depends_on:
       - pgvector

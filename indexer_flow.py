@@ -178,7 +178,7 @@ async def process_file(
 
 
 @coco.fn
-async def app_main(sourcedir: pathlib.Path) -> None:
+async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
     table_schema = await postgres.TableSchema.from_class(
         CodeEmbedding,
         primary_key=["id"],
@@ -248,7 +248,7 @@ async def _search_async(
                 ORDER BY score DESC
                 LIMIT $2
                 """,
-                query_vec,
+                str(query_vec.tolist()),
                 fetch_k,
             )
 

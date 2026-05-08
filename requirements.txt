@@ -9,3 +9,5 @@ numpy
 # Langchain — chỉ cần core + Ollama (OpenAI/Gemini thêm sau nếu cần)
 langchain
 langchain-ollama
+torch
+torchvision

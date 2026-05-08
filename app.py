@@ -186,10 +186,9 @@ with st.sidebar:
 
             try:
                 async def _run_update():
-                    async with coco_app.run():
-                        if btn_reindex:
-                            await coco_app.drop()
-                        await coco_app.update()
+                    if btn_reindex:
+                        await coco_app.drop()
+                    await coco_app.update()
 
                 asyncio.run(_run_update())
 
