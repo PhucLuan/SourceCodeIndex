@@ -1,12 +1,11 @@
 streamlit
-cocoindex
-# psycopg v3 + pool + pgvector (theo pattern chính thức của CocoIndex code_embedding example)
-psycopg[pool,binary]
-pgvector
-# Langchain
+
+# CocoIndex v1.x — extras bundled: postgres connector + sentence_transformers
+cocoindex[postgres,sentence_transformers]>=1.0.2
+asyncpg>=0.29.0
+pgvector>=0.4.1
+numpy
+
+# Langchain — chỉ cần core + Ollama (OpenAI/Gemini thêm sau nếu cần)
 langchain
-langchain-community
-langchain-openai
-langchain-google-genai
-# Embedding model (vẫn cần để SentenceTransformerEmbed của CocoIndex hoạt động)
-sentence-transformers
+langchain-ollama

@@ -1,81 +1,116 @@
+"""
+RAG layer — kết nối CocoIndex search với LangChain LLM.
+
+Cải tiến:
+- query_cocoindex_db nhận exclude_tests param → user chọn được
+- generate_answer_stream có prompt chuyên về code search + hướng dẫn LLM
+  ưu tiên file logic, bỏ qua unit test nếu user không hỏi về test
+"""
+
 import os
 from langchain_core.documents import Document
-from langchain_community.llms.ollama import Ollama
-from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
 
-import cocoindex
 import streamlit as st
 
-# Import search handler và flow đã được đăng ký trong indexer_flow.
-# CocoIndex sẽ init và quản lý connection pool bên trong.
-from indexer_flow import search as _cocoindex_search
+from indexer_flow import search as _search
 
 
-def query_cocoindex_db(query_text: str, top_k: int = 5) -> list[Document]:
+def query_cocoindex_db(
+    query_text: str,
+    top_k: int = 8,
+    exclude_tests: bool = True,
+) -> list[Document]:
     """
-    Semantic search dùng built-in CocoIndex query handler.
-    Không cần viết SQL hay quản lý embedding model thủ công.
+    Semantic search dùng indexer_flow.search() với pgvector cosine similarity.
+
+    Args:
+        query_text: câu hỏi của user
+        top_k: số context chunks đưa vào LLM
+        exclude_tests: True → loại test files, ưu tiên logic implementation
     """
     try:
-        # Gọi thẳng CocoIndex search handler đã khai báo với @code_embedding_flow.query_handler()
-        # Hàm này tự embed query bằng code_to_embedding.eval() rồi query pgvector
-        query_output = _cocoindex_search(query_text)
-
-        docs = []
-        for result in query_output.results[:top_k]:
-            docs.append(Document(
-                page_content=result["text"],
+        results = _search(query_text, top_k=top_k, exclude_tests=exclude_tests)
+        return [
+            Document(
+                page_content=r["text"],
                 metadata={
-                    "filename": result["filename"],
-                    "lang":     result["lang"],
-                    "score":    result["score"],
-                }
-            ))
-        return docs
-
+                    "filename":   r["filename"],
+                    "lang":       r["lang"],
+                    "score":      r["score"],
+                    "start_line": r["start_line"],
+                    "end_line":   r["end_line"],
+                    "is_test":    r["is_test"],
+                },
+            )
+            for r in results
+        ]
     except Exception as e:
         st.error(f"Lỗi khi query CocoIndex: {e}")
         return []
 
 
-def get_llm(llm_choice, model_name="llama-local", api_key=None, ollama_host=None):
+def get_llm(llm_choice, model_name="qwen2.5:32b", api_key=None, ollama_host=None):
     if llm_choice == "Ollama":
         url = ollama_host or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        return Ollama(model=model_name, base_url=url)
-    elif llm_choice == "OpenAI":
-        return ChatOpenAI(model="gpt-4o", openai_api_key=api_key)
-    elif llm_choice == "Gemini":
-        return ChatGoogleGenerativeAI(model="gemini-1.5-pro", google_api_key=api_key)
+        return OllamaLLM(model=model_name, base_url=url)
+    elif llm_choice in ("OpenAI", "Gemini"):
+        raise NotImplementedError(
+            f"{llm_choice} chưa được hỗ trợ. "
+            "Cài langchain-openai hoặc langchain-google-genai vào requirements.txt."
+        )
     else:
-        raise ValueError("Unknown LLM choice")
+        raise ValueError(f"Unknown LLM choice: {llm_choice}")
 
 
-def generate_answer_stream(query_text, docs, llm):
+def generate_answer_stream(query_text: str, docs: list[Document], llm):
     """
-    Generate an answer using Streaming approach for smoother UI.
+    Stream câu trả lời từ LLM dựa trên context từ pgvector search.
+
+    Prompt được thiết kế để:
+    - Ưu tiên trả lời từ file logic, không phải test file
+    - Chỉ rõ tên file + số dòng để dễ tra cứu
+    - Thừa nhận khi không đủ thông tin
     """
-    prompt_template = """
-Bạn là một kỹ sư phần mềm cấp cao hỗ trợ trả lời các câu hỏi về chuyên môn code. Dưới đây là các đoạn mã nguồn và tài liệu liên quan được trích xuất từ codebase hiện tại:
+    prompt_template = """\
+Bạn là một kỹ sư phần mềm cấp cao đang hỗ trợ phân tích mã nguồn.
+Dưới đây là các đoạn mã liên quan được trích xuất từ codebase (sắp xếp theo mức độ liên quan giảm dần):
 
 <context>
 {context}
 </context>
 
-Dựa vào các trích đoạn trên, hãy trả lời câu hỏi sau của người dùng một cách chi tiết và chính xác. 
-Nếu có thể, hãy trích dẫn cụ thể tên file để người dùng dễ dàng theo dõi (tên file được cung cấp trên mỗi phần). Nếu bạn không tìm thấy câu trả lời, hãy nói là với context trên không đủ thông tin.
+Hướng dẫn trả lời:
+1. Ưu tiên thông tin từ các file implementation/logic (không phải test file)
+2. Khi trích dẫn code, ghi rõ tên file và số dòng (nếu có)
+3. Nếu nhiều file cùng có logic liên quan, liệt kê tất cả
+4. Nếu context không đủ để trả lời chắc chắn, hãy nói rõ và gợi ý nơi tìm thêm
+5. Trả lời bằng tiếng Việt nếu câu hỏi bằng tiếng Việt
 
 Câu hỏi: {question}
-Chuyên gia trả lời:"""
+
+Phân tích và trả lời:"""
 
     prompt = PromptTemplate.from_template(prompt_template)
 
-    context_str = "\n\n".join([
-        f"--- File: {d.metadata.get('filename')} (score: {d.metadata.get('score', 0):.3f}) ---\n{d.page_content}"
-        for d in docs
-    ])
+    # Build context với file location rõ ràng
+    context_parts = []
+    for d in docs:
+        meta = d.metadata
+        filename = meta.get("filename", "unknown")
+        start = meta.get("start_line", "?")
+        end = meta.get("end_line", "?")
+        score = meta.get("score", 0)
+        is_test = meta.get("is_test", False)
+        tag = " [TEST FILE]" if is_test else ""
 
+        context_parts.append(
+            f"--- {filename}:L{start}-L{end}{tag} (relevance: {score:.3f}) ---\n"
+            f"{d.page_content}"
+        )
+
+    context_str = "\n\n".join(context_parts)
     chain = prompt | llm
 
     for chunk in chain.stream({"context": context_str, "question": query_text}):
