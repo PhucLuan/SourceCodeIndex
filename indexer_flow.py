@@ -220,27 +220,16 @@ app = coco.App(
 async def _search_async(
     query_text: str,
     top_k: int = TOP_K,
-    exclude_tests: bool = True,
 ) -> list[dict]:
     """
     Query pgvector với cosine similarity.
-
-    Args:
-        query_text: câu hỏi của user
-        top_k: số kết quả trả về
-        exclude_tests: nếu True, loại bỏ test files khỏi kết quả
-                      → ưu tiên logic thực thay vì unit test
     """
     embedder = SentenceTransformerEmbedder(EMBED_MODEL)
     # Enrich query giống như lúc index (cải thiện consistency)
     enriched_query = f"Code search query: {query_text}"
-    query_vec: NDArray = await embedder.embed(enriched_query)
+    query_vec = await embedder.embed(enriched_query)
 
-    # Lấy nhiều hơn top_k để có đủ results sau khi filter test files
-    fetch_k = top_k * 3 if exclude_tests else top_k
-
-    test_filter = "AND is_test = FALSE" if exclude_tests else ""
-
+    # Sử dụng Pure Semantic Search: Cosine Similarity [0, 1]
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -248,19 +237,17 @@ async def _search_async(
                 SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name,
                        1.0 - (embedding <=> $1) AS score
                 FROM "{PG_SCHEMA}"."{TABLE_NAME}"
-                WHERE 1=1 {test_filter}
                 ORDER BY score DESC
                 LIMIT $2
                 """,
                 str(query_vec.tolist()),
-                fetch_k,
+                top_k,
             )
 
-    # Deduplicate: nếu cùng file có nhiều chunk, ưu tiên chunk score cao nhất
-    seen_files: dict[str, dict] = {}
+    # Chuyển đổi kết quả sang list dict
     results = []
     for r in rows:
-        result = {
+        results.append({
             "filename":   r["filename"],
             "lang":       r["lang"],
             "text":       r["text"],
@@ -270,11 +257,7 @@ async def _search_async(
             "is_test":    r["is_test"],
             "node_type":  r["node_type"],
             "node_name":  r["node_name"],
-        }
-        # Giữ chunk score cao nhất mỗi file, nhưng vẫn giữ tất cả chunks khác nhau
-        results.append(result)
-        if len(results) >= top_k:
-            break
+        })
 
     return results
 
@@ -282,7 +265,6 @@ async def _search_async(
 def search(
     query_text: str,
     top_k: int = TOP_K,
-    exclude_tests: bool = True,
 ) -> list[dict]:
     """Sync wrapper — gọi từ Streamlit."""
-    return asyncio.run(_search_async(query_text, top_k, exclude_tests))
+    return asyncio.run(_search_async(query_text, top_k))

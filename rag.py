@@ -2,9 +2,8 @@
 RAG layer — kết nối CocoIndex search với LangChain LLM.
 
 Cải tiến:
-- query_cocoindex_db nhận exclude_tests param → user chọn được
-- generate_answer_stream có prompt chuyên về code search + hướng dẫn LLM
-  ưu tiên file logic, bỏ qua unit test nếu user không hỏi về test
+- query_cocoindex_db: Sử dụng pure semantic search để phân biệt logic/test tự nhiên
+- generate_answer_stream: Có prompt chuyên về code search + hướng dẫn LLM
 """
 
 import os
@@ -20,18 +19,13 @@ from indexer_flow import search as _search
 def query_cocoindex_db(
     query_text: str,
     top_k: int = 8,
-    exclude_tests: bool = True,
 ) -> list[Document]:
     """
     Semantic search dùng indexer_flow.search() với pgvector cosine similarity.
-
-    Args:
-        query_text: câu hỏi của user
-        top_k: số context chunks đưa vào LLM
-        exclude_tests: True → loại test files, ưu tiên logic implementation
+    Dựa vào AST-enriched embeddings để tự động phân biệt logic/test.
     """
     try:
-        results = _search(query_text, top_k=top_k, exclude_tests=exclude_tests)
+        results = _search(query_text, top_k=top_k)
         return [
             Document(
                 page_content=r["text"],
@@ -69,9 +63,7 @@ def get_llm(llm_choice, model_name="qwen2.5:32b", api_key=None, ollama_host=None
 def generate_answer_stream(query_text: str, docs: list[Document], llm):
     """
     Stream câu trả lời từ LLM dựa trên context từ pgvector search.
-
     Prompt được thiết kế để:
-    - Ưu tiên trả lời từ file logic, không phải test file
     - Chỉ rõ tên file + số dòng để dễ tra cứu
     - Thừa nhận khi không đủ thông tin
     """
@@ -84,7 +76,7 @@ Dưới đây là các đoạn mã liên quan được trích xuất từ codeba
 </context>
 
 Hướng dẫn trả lời:
-1. Ưu tiên thông tin từ các file implementation/logic (không phải test file)
+1. Phân tích kỹ nội dung code để trả lời câu hỏi. 
 2. Khi trích dẫn code, ghi rõ tên file và số dòng (nếu có)
 3. Nếu nhiều file cùng có logic liên quan, liệt kê tất cả
 4. Nếu context không đủ để trả lời chắc chắn, hãy nói rõ và gợi ý nơi tìm thêm

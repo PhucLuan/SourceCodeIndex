@@ -247,14 +247,6 @@ with st.sidebar:
     # --- Search Config ---
     st.write("---")
     st.subheader("3. Tuỳ chỉnh Tìm kiếm")
-    exclude_tests = st.toggle(
-        "Ưu tiên logic (loại test files)",
-        value=True,
-        help=(
-            "Bật: kết quả search sẽ loại bỏ unit test, ưu tiên file implementation.\n"
-            "Tắt: tìm kiếm toàn bộ codebase kể cả test files."
-        ),
-    )
     top_k = st.slider("Số context chunks:", min_value=3, max_value=20, value=8)
 
 
@@ -277,18 +269,15 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
     with st.chat_message("user"):
         st.markdown(query)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Đang tìm kiếm và tổng hợp..."):
-            docs = query_cocoindex_db(query, top_k=top_k, exclude_tests=exclude_tests)
+    with st.chat_message("assistant"):        # 1. Search
+        with st.spinner("Đang tìm kiếm ngữ cảnh..."):
+            docs = query_cocoindex_db(
+                query, 
+                top_k=top_k,
+            )
 
             if not docs:
-                if exclude_tests:
-                    response = (
-                        "Không tìm thấy kết quả phù hợp trong logic files. "
-                        "Thử tắt 'Ưu tiên logic' để tìm rộng hơn, hoặc chạy lại Index."
-                    )
-                else:
-                    response = "Không tìm thấy thông tin. Đảm bảo đã Index source code."
+                response = "Không tìm thấy thông tin phù hợp. Đảm bảo đã Index source code."
                 st.markdown(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
             else:
