@@ -1,0 +1,112 @@
+# Kế hoạch triển khai Phase 1: Tích hợp Tree-sitter vào Code_Embedding Flow
+
+Kế hoạch này hướng dẫn chi tiết cách nâng cấp tiến trình Code_Embedding để sử dụng đầy đủ sức mạnh của Tree-sitter và Abstract Syntax Tree (AST), dựa trên cấu trúc API chuẩn xác của CocoIndex (v1.x/v0.x) và repo `realtime-codebase-indexing`.
+
+## Đính chính quan trọng từ quá trình điều tra API
+Quá trình kiểm tra trực tiếp mã nguồn thư viện `cocoindex` và `cocoindex_code` cho thấy:
+1. Hàm `RecursiveSplitter` (mà bạn đang dùng) và `cocoindex.functions.SplitRecursively()` **đã tích hợp sẵn Tree-sitter** ngầm bên trong. Khi bạn truyền `language=lang`, nó đã cố gắng cắt code dựa trên các ranh giới cú pháp (syntax boundaries) thay vì cắt ngang văn bản mù quáng.
+2. Tuy nhiên, `RecursiveSplitter` mặc định chỉ trả về Text (với `start_line` / `end_line`) mà **không trích xuất các metadata cấu trúc** như `node_type` (class/function) hay `node_name` mà bạn mong muốn.
+3. API của CocoIndex không có sẵn các hàm ảo như `ExtractClass` hay `ExtractFunction`. Thay vào đó, CocoIndex cung cấp giao diện `cocoindex_code.chunking.ChunkerFn` để bạn tự do tuỳ chỉnh cách phân tách AST. Ngoài ra, repository `realtime-codebase-indexing` sử dụng **Declarative Flow API** (`@cocoindex.flow_def`, `cocoindex.functions`) là cấu trúc hiện đại nhất.
+
+Do đó, Phase 1 sẽ tập trung vào 2 mục tiêu: (1) Cấu trúc lại Flow theo chuẩn Declarative của CocoIndex, và (2) Tuỳ biến quá trình Chunking để lấy metadata cấu trúc (AST).
+
+> [!IMPORTANT]
+> **User Review Required:**
+> Mã nguồn hiện tại của bạn đang sử dụng **Imperative API** (các hàm `coco.fn`, `coco.mount_each`). Mã nguồn mẫu mới nhất của CocoIndex sử dụng **Declarative Flow API** (`@cocoindex.flow_def`, `transform_flow`, `DataScope`).
+> Bạn có đồng ý **viết lại `indexer_flow.py` sang cấu trúc Declarative** (như `main.py` trong repo `realtime-codebase-indexing` của CocoIndex) hay muốn giữ nguyên cấu trúc Imperative cũ và chỉ nhúng custom chunker vào?
+> (Kế hoạch dưới đây đề xuất chuyển đổi sang cấu trúc Declarative để chuẩn hoá theo tài liệu mới nhất).
+
+## Các bước triển khai chi tiết
+
+### 1. Nâng cấp cấu trúc Schema để lưu trữ AST Metadata
+Bổ sung các trường cần thiết vào bảng CSDL để hỗ trợ Graph và Semantic Search sau này.
+
+#### [MODIFY] `indexer_flow.py`
+* Cập nhật `CodeEmbedding` (hoặc định nghĩa cấu trúc dữ liệu xuất ra) để thêm các trường AST:
+  ```python
+  @dataclass
+  class CodeEmbedding:
+      id: int
+      filename: str
+      lang: str
+      text: str
+      embedding: Annotated[NDArray, EMBEDDER]
+      start_line: int
+      end_line: int
+      is_test: bool
+      # THÊM MỚI CHO AST:
+      node_type: str  # "class", "function", "method", "global"
+      node_name: str  # Tên class/function để tìm kiếm chính xác
+      parent_name: str # (Tuỳ chọn) Lưu class cha của một method
+  ```
+
+### 2. Xây dựng Custom AST Chunker sử dụng Tree-sitter
+Do `RecursiveSplitter` mặc định không nhả ra `node_type` và `node_name`, ta sẽ viết một hàm biến đổi tuỳ chỉnh, dùng trực tiếp `tree-sitter` (hoặc kế thừa `ChunkerFn` từ `cocoindex_code.chunking`).
+
+#### [NEW] `ast_chunker.py` (hoặc thêm vào `indexer_flow.py`)
+* Import thư viện `tree_sitter` và `tree_sitter_python`, `tree_sitter_javascript` v.v...
+* Khai báo hàm phân tích AST đệ quy, nhận vào nội dung file và trả về các "Node Chunk":
+  ```python
+  from tree_sitter import Parser, Language
+  from cocoindex.resources.chunk import Chunk
+  import tree_sitter_python
+  
+  # Ví dụ parser cho Python
+  PY_LANGUAGE = Language(tree_sitter_python.language(), "python")
+  
+  def extract_ast_nodes(text: str, lang: str):
+      """Hàm tự viết dùng Tree-sitter để Parse và lấy Function/Class metadata."""
+      parser = Parser()
+      parser.set_language(PY_LANGUAGE)
+      tree = parser.parse(bytes(text, "utf8"))
+      
+      # (Logic duyệt cây tree.root_node để tìm class_definition, function_definition)
+      # Yield ra nội dung, node_type, node_name, start_line, end_line
+  ```
+
+### 3. Áp dụng Declarative Flow API của CocoIndex (hoặc tích hợp vào Imperative)
+
+Nếu dùng **Declarative API** (như repo `realtime-codebase-indexing`):
+```python
+import cocoindex
+from cocoindex.functions import DetectProgrammingLanguage
+
+@cocoindex.transform_flow()
+def parse_ast_and_embed(file: cocoindex.DataSlice) -> cocoindex.DataSlice:
+    # 1. Phát hiện ngôn ngữ
+    lang = file["filename"].transform(DetectProgrammingLanguage())
+    
+    # 2. Sử dụng hàm custom extract_ast_nodes để lấy node thay vì SplitRecursively
+    # Hoặc có thể wrapper thành 1 function của Cocoindex
+    # ...
+```
+
+Nếu tiếp tục dùng **Imperative API** (giữ nguyên cách viết hiện tại của bạn ở `indexer_flow.py`):
+#### [MODIFY] `indexer_flow.py`
+Thay thế đoạn gọi `_splitter.split()` trong `process_file`:
+```diff
+-    chunks = _splitter.split(
+-        text, chunk_size=1500, min_chunk_size=100, chunk_overlap=300, language=lang if lang else None
+-    )
++    # Sử dụng AST Chunker để lấy các khối logic
++    ast_chunks = extract_ast_nodes(text, lang)
+     await coco.map(
+         process_chunk,
+-        chunks,
++        ast_chunks,  # Truyền các chunk có chứa AST Metadata
+         filepath,
+         ...
+     )
+```
+Và cập nhật `process_chunk` để nhận thêm tham số `node_type`, `node_name` và lưu xuống DB.
+
+## Kế hoạch kiểm tra (Verification Plan)
+
+### Automated/Manual Tests
+* **Cập nhật mã nguồn & chạy Indexer**: Nhấn nút `Cập nhật Index` trên Streamlit UI.
+* **Kiểm tra DB Postgres**: Truy cập vào PostgreSQL kiểm tra bảng `code_embeddings`, đảm bảo các cột `node_type` (chứa các giá trị như `class`, `function`) và `node_name` (chứa tên hàm/lớp tương ứng) đã được ghi nhận đúng thay vì chỉ lưu một khối văn bản gãy ngang.
+* **Kiểm tra Semantic Search**: Đảm bảo các kết quả trả về mang trọn vẹn ngữ cảnh của hàm hoặc class, chứ không phải các dòng code bị cắt xén (do `chunk_size` giới hạn).
+
+---
+**Câu hỏi mở cho bạn:** 
+Bạn có muốn tôi bắt tay vào việc bổ sung logic Tree-Sitter (sử dụng thư viện `tree-sitter`) vào mã nguồn hiện tại của bạn không? Và bạn quyết định giữ nguyên cấu trúc Imperative hay nâng cấp sang Declarative Flow API?

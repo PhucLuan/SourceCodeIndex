@@ -14,6 +14,8 @@ import json
 import os
 import shutil
 import asyncio
+import asyncpg
+
 from indexer_flow import app as coco_app
 from rag import query_cocoindex_db, get_llm, generate_answer_stream
 
@@ -187,7 +189,35 @@ with st.sidebar:
             try:
                 async def _run_update():
                     if btn_reindex:
-                        await coco_app.drop()
+                        # 1. Ép xóa table bằng SQL thay vì dựa vào coco_app.drop() (tránh lỗi cache schema)
+                        db_url = os.environ.get(
+                            "COCOINDEX_DATABASE_URL", 
+                            "postgresql://cocoindex:cocoindex_password@localhost:5432/cocoindex_db"
+                        )
+                        try:
+                            conn = await asyncpg.connect(db_url)
+                            await conn.execute('DROP TABLE IF EXISTS "public"."code_embeddings" CASCADE')
+                            await conn.close()
+                        except Exception as e:
+                            pass
+                            
+                        # 2. Vẫn gọi drop của cocoindex để dọn dẹp nội bộ
+                        try:
+                            await coco_app.drop()
+                        except Exception:
+                            pass
+                            
+                        # 3. Xoá DB local file/thư mục
+                        db_path = os.environ.get("COCOINDEX_DB", "/app/cocoindex.db")
+                        if os.path.exists(db_path):
+                            try:
+                                if os.path.isdir(db_path):
+                                    shutil.rmtree(db_path)
+                                else:
+                                    os.remove(db_path)
+                            except Exception as db_err:
+                                st.warning(f"Không thể xoá DB cache cũ: {db_err}")
+                                
                     await coco_app.update()
 
                 asyncio.run(_run_update())
@@ -281,9 +311,12 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                             end = meta.get("end_line", "?")
                             score = meta.get("score", 0)
                             is_test = meta.get("is_test", False)
+                            node_type = meta.get("node_type", "")
+                            node_name = meta.get("node_name", "")
                             tag = " 🧪 TEST" if is_test else ""
+                            node_info = f" **[{node_type.upper()}: {node_name}]**" if node_type and node_name else ""
                             st.write(
-                                f"**[{idx+1}]** `{filename}`  "
+                                f"**[{idx+1}]** `{filename}`{node_info}  "
                                 f"L{start}–L{end}{tag}  *(score: {score:.3f})*"
                             )
                             st.code(

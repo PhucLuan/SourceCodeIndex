@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+import sys
 from dataclasses import dataclass
 from typing import Annotated, AsyncIterator
 
@@ -34,11 +35,12 @@ from numpy.typing import NDArray
 
 import cocoindex as coco
 from cocoindex.connectors import localfs, postgres
-from cocoindex.ops.text import RecursiveSplitter, detect_code_language
+from cocoindex.ops.text import detect_code_language
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
-from cocoindex.resources.chunk import Chunk
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from cocoindex.resources.id import IdGenerator
+
+from ast_chunker import extract_ast_nodes
 
 
 # ─── Cấu hình ────────────────────────────────────────────────────────────────
@@ -76,8 +78,6 @@ TEST_PATTERNS = {"test", "tests", "spec", "specs", "__tests__", "_test", ".test"
 PG_DB    = coco.ContextKey[asyncpg.Pool]("code_embedding_db")
 EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_change=True)
 
-_splitter = RecursiveSplitter()
-
 
 # ─── Schema ──────────────────────────────────────────────────────────────────
 
@@ -91,6 +91,8 @@ class CodeEmbedding:
     start_line: int
     end_line: int
     is_test: bool    # True nếu file nằm trong thư mục test hoặc tên có _test/_spec
+    node_type: str   # class, function, file, ...
+    node_name: str   # Tên class/hàm
 
 
 # ─── Helper: phát hiện test file ─────────────────────────────────────────────
@@ -123,15 +125,15 @@ async def coco_lifespan(builder: coco.EnvironmentBuilder) -> AsyncIterator[None]
 
 @coco.fn
 async def process_chunk(
-    chunk: Chunk,
+    chunk,
     filename: pathlib.PurePath,
     lang: str,
     is_test: bool,
     id_gen: IdGenerator,
     table: postgres.TableTarget[CodeEmbedding],
 ) -> None:
-    # Thêm prefix filename vào text trước khi embed để anchor ngữ cảnh
-    enriched_text = f"File: {filename}\n\n{chunk.text}"
+    # Thêm prefix filename, node_type, node_name vào text trước khi embed để anchor ngữ cảnh
+    enriched_text = f"File: {filename}\nType: {chunk.node_type}\nName: {chunk.node_name}\n\n{chunk.text}"
     embedding = await coco.use_context(EMBEDDER).embed(enriched_text)
 
     table.declare_row(
@@ -141,9 +143,11 @@ async def process_chunk(
             lang=lang,
             text=chunk.text,          # lưu text gốc (không prefix) để hiển thị
             embedding=embedding,
-            start_line=chunk.start.line,
-            end_line=chunk.end.line,
+            start_line=chunk.start_line,
+            end_line=chunk.end_line,
             is_test=is_test,
+            node_type=chunk.node_type,
+            node_name=chunk.node_name,
         )
     )
 
@@ -155,16 +159,13 @@ async def process_file(
 ) -> None:
     text = await file.read_text()
     filepath = file.file_path.path
+    # === [DEBUG_LOG_START] ===
+    sys.stderr.write(f"[DEBUG] VÀO process_file: {filepath}\n")
+    # === [DEBUG_LOG_END] ===
     lang = detect_code_language(filename=str(filepath.name)) or ""
     is_test = _is_test_file(filepath)
 
-    chunks = _splitter.split(
-        text,
-        chunk_size=1500,       # tăng chunk_size để giữ nhiều context hơn
-        min_chunk_size=100,
-        chunk_overlap=300,     # overlap lớn hơn để không mất logic ở ranh giới
-        language=lang if lang else None,
-    )
+    chunks = extract_ast_nodes(text, lang)
     id_gen = IdGenerator()
     await coco.map(
         process_chunk,
@@ -199,6 +200,9 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
             excluded_patterns=EXCLUDED_PATTERNS,
         ),
     )
+    # === [DEBUG_LOG_START] ===
+    sys.stderr.write(f"[DEBUG] app_main: sourcedir={sourcedir}\n")
+    # === [DEBUG_LOG_END] ===
     await coco.mount_each(process_file, files.items(), target_table)
 
 
@@ -241,7 +245,7 @@ async def _search_async(
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT filename, lang, text, start_line, end_line, is_test,
+                SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name,
                        1.0 - (embedding <=> $1) AS score
                 FROM "{PG_SCHEMA}"."{TABLE_NAME}"
                 WHERE 1=1 {test_filter}
@@ -264,6 +268,8 @@ async def _search_async(
             "start_line": r["start_line"],
             "end_line":   r["end_line"],
             "is_test":    r["is_test"],
+            "node_type":  r["node_type"],
+            "node_name":  r["node_name"],
         }
         # Giữ chunk score cao nhất mỗi file, nhưng vẫn giữ tất cả chunks khác nhau
         results.append(result)

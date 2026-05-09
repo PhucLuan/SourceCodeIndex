@@ -42,6 +42,8 @@ def query_cocoindex_db(
                     "start_line": r["start_line"],
                     "end_line":   r["end_line"],
                     "is_test":    r["is_test"],
+                    "node_type":  r.get("node_type", ""),
+                    "node_name":  r.get("node_name", ""),
                 },
             )
             for r in results
@@ -103,10 +105,14 @@ Phân tích và trả lời:"""
         end = meta.get("end_line", "?")
         score = meta.get("score", 0)
         is_test = meta.get("is_test", False)
+        node_type = meta.get("node_type", "")
+        node_name = meta.get("node_name", "")
         tag = " [TEST FILE]" if is_test else ""
 
+        node_info = f" [{node_type.upper()}: {node_name}]" if node_type and node_name else ""
+
         context_parts.append(
-            f"--- {filename}:L{start}-L{end}{tag} (relevance: {score:.3f}) ---\n"
+            f"--- {filename}:L{start}-L{end}{node_info}{tag} (relevance: {score:.3f}) ---\n"
             f"{d.page_content}"
         )
 
