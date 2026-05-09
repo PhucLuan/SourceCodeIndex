@@ -26,6 +26,7 @@ import asyncio
 import os
 import pathlib
 import sys
+import time
 from dataclasses import dataclass
 from typing import Annotated, AsyncIterator
 
@@ -224,12 +225,29 @@ async def _search_async(
     """
     Query pgvector với cosine similarity.
     """
-    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
-    # Enrich query giống như lúc index (cải thiện consistency)
-    enriched_query = f"Code search query: {query_text}"
-    query_vec = await embedder.embed(enriched_query)
+    # === [DEBUG_LOG_START] ===
+    total_start = time.perf_counter()
+    # === [DEBUG_LOG_END] ===
 
-    # Sử dụng Pure Semantic Search: Cosine Similarity [0, 1]
+    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
+    enriched_query = f"Code search query: {query_text}"
+    
+    # --- Giai đoạn 1: Tạo Embedding ---
+    # === [DEBUG_LOG_START] ===
+    embed_start = time.perf_counter()
+    # === [DEBUG_LOG_END] ===
+    
+    query_vec = await embedder.embed(enriched_query)
+    
+    # === [DEBUG_LOG_START] ===
+    embed_duration = time.perf_counter() - embed_start
+    # === [DEBUG_LOG_END] ===
+
+    # --- Giai đoạn 2: Postgres Search ---
+    # === [DEBUG_LOG_START] ===
+    db_start = time.perf_counter()
+    # === [DEBUG_LOG_END] ===
+
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -243,6 +261,18 @@ async def _search_async(
                 str(query_vec.tolist()),
                 top_k,
             )
+
+    # === [DEBUG_LOG_START] ===
+    db_duration = time.perf_counter() - db_start
+    total_duration = time.perf_counter() - total_start
+    
+    sys.stderr.write(f"\n[METRICS] Chi tiết tìm kiếm:\n")
+    sys.stderr.write(f"  - Tổng thời gian:      {total_duration:.4f}s\n")
+    sys.stderr.write(f"  - Tạo Embedding:       {embed_duration:.4f}s\n")
+    sys.stderr.write(f"  - Postgres Search:     {db_duration:.4f}s\n")
+    sys.stderr.write(f"=============================================\n")
+    sys.stderr.flush()
+    # === [DEBUG_LOG_END] ===
 
     # Chuyển đổi kết quả sang list dict
     results = []

@@ -7,6 +7,8 @@ Cải tiến:
 """
 
 import os
+import time
+import sys
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
@@ -26,6 +28,7 @@ def query_cocoindex_db(
     """
     try:
         results = _search(query_text, top_k=top_k)
+        
         return [
             Document(
                 page_content=r["text"],
@@ -84,7 +87,7 @@ Hướng dẫn trả lời:
 
 Câu hỏi: {question}
 
-Phân tích và trả lời:"""
+Phân tích và trả lời bằng tiếng Việt hoặc tiếng Anh:"""
 
     prompt = PromptTemplate.from_template(prompt_template)
 
