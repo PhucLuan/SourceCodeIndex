@@ -21,13 +21,14 @@ from indexer_flow import search as _search
 def query_cocoindex_db(
     query_text: str,
     top_k: int = 8,
+    source_filters: list[str] = None,
 ) -> list[Document]:
     """
     Semantic search dùng indexer_flow.search() với pgvector cosine similarity.
     Dựa vào AST-enriched embeddings để tự động phân biệt logic/test.
     """
     try:
-        results = _search(query_text, top_k=top_k)
+        results = _search(query_text, top_k=top_k, source_filters=source_filters)
         
         return [
             Document(

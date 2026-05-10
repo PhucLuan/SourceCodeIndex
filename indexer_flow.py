@@ -202,13 +202,30 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
         CodeEmbedding,
         primary_key=["id"],
     )
-    target_table = await postgres.mount_table_target(
-        PG_DB,
-        table_name=TABLE_NAME,
-        table_schema=table_schema,
-        pg_schema_name=PG_SCHEMA,
-    )
-    target_table.declare_vector_index(column="embedding")
+    try:
+        target_table = await postgres.mount_table_target(
+            PG_DB,
+            table_name=TABLE_NAME,
+            table_schema=table_schema,
+            pg_schema_name=PG_SCHEMA,
+        )
+        # Chỉ tạo index nếu bảng mới được tạo hoặc chưa có index
+        try:
+            target_table.declare_vector_index(column="embedding")
+        except Exception:
+            # Bỏ qua nếu index đã tồn tại
+            pass
+    except Exception as e:
+        if "already exists" in str(e):
+            # Nếu mount thất bại vì bảng đã có, ta thử lấy lại target mà không tạo mới
+            target_table = await postgres.mount_table_target(
+                PG_DB,
+                table_name=TABLE_NAME,
+                table_schema=table_schema,
+                pg_schema_name=PG_SCHEMA,
+            )
+        else:
+            raise e
 
     # Walk toàn bộ thư mục workspace — recursive=True đảm bảo lấy hết thư mục con
     files = localfs.walk_dir(
@@ -238,6 +255,7 @@ app = coco.App(
 async def _search_async(
     query_text: str,
     top_k: int = TOP_K,
+    source_filters: Optional[List[str]] = None,
 ) -> list[dict]:
     """
     Query pgvector với cosine similarity.
@@ -265,19 +283,32 @@ async def _search_async(
     db_start = time.perf_counter()
     # === [DEBUG_LOG_END] ===
 
+    # Xây dựng SQL filter nếu có source_filters
+    filter_sql = ""
+    if source_filters:
+        # source_filters là list các prefix đường dẫn (vd: /host_c/Project1)
+        # Vì path trong Docker đã được map, ta dùng LIKE hoặc so khớp prefix
+        conditions = []
+        for i, src in enumerate(source_filters):
+            conditions.append(f"filename LIKE ${i+3} || '%'")
+        filter_sql = "AND (" + " OR ".join(conditions) + ")"
+
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
+            query = f"""
                 SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
                        1.0 - (embedding <=> $1) AS score
                 FROM "{PG_SCHEMA}"."{TABLE_NAME}"
+                WHERE 1=1 {filter_sql}
                 ORDER BY score DESC
                 LIMIT $2
-                """,
-                str(query_vec.tolist()),
-                top_k,
-            )
+            """
+            # Tham số: $1: query_vec, $2: top_k, $3...: source_filters
+            params = [str(query_vec.tolist()), top_k]
+            if source_filters:
+                params.extend(source_filters)
+                
+            rows = await conn.fetch(query, *params)
 
     # === [DEBUG_LOG_START] ===
     db_duration = time.perf_counter() - db_start
@@ -319,6 +350,17 @@ async def _search_async(
 def search(
     query_text: str,
     top_k: int = TOP_K,
+    source_filters: Optional[List[str]] = None,
 ) -> list[dict]:
-    """Sync wrapper — gọi từ Streamlit."""
-    return asyncio.run(_search_async(query_text, top_k))
+    """Sync wrapper — quản lý loop an toàn cho Streamlit."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    return loop.run_until_complete(_search_async(query_text, top_k, source_filters))

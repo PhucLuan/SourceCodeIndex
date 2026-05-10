@@ -3,6 +3,8 @@ import sys
 import tree_sitter
 import tree_sitter_python
 import tree_sitter_c_sharp
+import tree_sitter_javascript
+import tree_sitter_typescript
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -22,6 +24,26 @@ try:
     parsers["c_sharp"] = parsers["csharp"]  # Support both variants
 except Exception as e:
     logger.warning(f"Could not load csharp parser: {e}")
+
+try:
+    JS_LANGUAGE = tree_sitter.Language(tree_sitter_javascript.language())
+    parsers["javascript"] = tree_sitter.Parser(JS_LANGUAGE)
+    parsers["js"] = parsers["javascript"]
+except Exception as e:
+    logger.warning(f"Could not load javascript parser: {e}")
+
+try:
+    TS_LANGUAGE = tree_sitter.Language(tree_sitter_typescript.language_typescript())
+    parsers["typescript"] = tree_sitter.Parser(TS_LANGUAGE)
+    parsers["ts"] = parsers["typescript"]
+except Exception as e:
+    logger.warning(f"Could not load typescript parser: {e}")
+
+try:
+    TSX_LANGUAGE = tree_sitter.Language(tree_sitter_typescript.language_tsx())
+    parsers["tsx"] = tree_sitter.Parser(TSX_LANGUAGE)
+except Exception as e:
+    logger.warning(f"Could not load tsx parser: {e}")
 
 @dataclass
 class AstChunk:
@@ -76,7 +98,10 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
         target_types = {
             "python": {"class_definition", "function_definition"},
             "c_sharp": {"class_declaration", "method_declaration", "interface_declaration", "enum_declaration", "struct_declaration"},
-            "csharp": {"class_declaration", "method_declaration", "interface_declaration", "enum_declaration", "struct_declaration"}
+            "csharp": {"class_declaration", "method_declaration", "interface_declaration", "enum_declaration", "struct_declaration"},
+            "javascript": {"class_declaration", "function_declaration", "method_definition"},
+            "typescript": {"class_declaration", "function_declaration", "method_definition", "interface_declaration", "enum_declaration"},
+            "tsx": {"class_declaration", "function_declaration", "method_definition", "interface_declaration", "enum_declaration"}
         }.get(lang, set())
 
         # Stage 1: Thu thập tất cả các node và phân cấp

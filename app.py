@@ -249,6 +249,19 @@ with st.sidebar:
     st.subheader("3. Tuỳ chỉnh Tìm kiếm")
     top_k = st.slider("Số context chunks:", min_value=3, max_value=20, value=8)
 
+    # --- Source Filter ---
+    st.write("---")
+    st.subheader("4. Lọc theo Project")
+    all_sources = load_sources()
+    selected_sources = st.multiselect(
+        "Chỉ tìm trong các nguồn này:",
+        options=all_sources,
+        default=None,
+        help="Để trống để tìm kiếm trong toàn bộ các nguồn đã index."
+    )
+    # Map sang Docker path để query DB
+    mapped_filters = [_map_windows_path(s) for s in selected_sources] if selected_sources else None
+
 
 # ─── MAIN UI ─────────────────────────────────────────────────────────────────
 
@@ -274,6 +287,7 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
             docs = query_cocoindex_db(
                 query, 
                 top_k=top_k,
+                source_filters=mapped_filters
             )
 
             if not docs:
