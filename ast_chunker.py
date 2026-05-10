@@ -3,7 +3,7 @@ import sys
 import tree_sitter
 import tree_sitter_python
 import tree_sitter_c_sharp
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -30,31 +30,38 @@ class AstChunk:
     node_name: str
     start_line: int
     end_line: int
+    is_skeleton: bool = False
+    parent_name: Optional[str] = None
+    references: List[str] = field(default_factory=list)
 
 def get_node_name(node, source_bytes: bytes) -> str:
-    """Lấy tên của node class hoặc function bằng cách tìm field 'name' hoặc 'identifier'."""
-    # Thử lấy qua field name (Python) hoặc identifier (C#)
-    for field in ['name', 'identifier']:
-        name_node = node.child_by_field_name(field)
+    """Lấy tên của node class hoặc function."""
+    for field_name in ['name', 'identifier']:
+        name_node = node.child_by_field_name(field_name)
         if name_node:
             return source_bytes[name_node.start_byte:name_node.end_byte].decode('utf-8')
     
-    # Fallback: Tìm con trực tiếp có kiểu 'identifier'
     for child in node.children:
         if child.type == 'identifier':
             return source_bytes[child.start_byte:child.end_byte].decode('utf-8')
             
     return "unknown"
 
+def get_signature(node, source_bytes: bytes) -> str:
+    """Lấy dòng khai báo (chữ ký) của node."""
+    # Thường là dòng đầu tiên của node hoặc đến khi gặp '{' hoặc ':'
+    text = source_bytes[node.start_byte:node.end_byte].decode('utf-8')
+    first_line = text.split('\n')[0].strip()
+    return first_line
+
 def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
     """
-    Parse AST từ text và trích xuất các Node như class_definition, function_definition.
+    Parse AST và trích xuất các Node cùng với Skeleton Index.
     """
     parser = parsers.get(lang)
     chunks = []
 
     if not parser:
-        # Fallback if language not supported
         chunks = [AstChunk(
             text=text, 
             node_type="file", 
@@ -66,32 +73,72 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
         source_bytes = text.encode('utf-8')
         tree = parser.parse(source_bytes)
         
-        # Mapping node types by language
         target_types = {
             "python": {"class_definition", "function_definition"},
             "c_sharp": {"class_declaration", "method_declaration", "interface_declaration", "enum_declaration", "struct_declaration"},
             "csharp": {"class_declaration", "method_declaration", "interface_declaration", "enum_declaration", "struct_declaration"}
         }.get(lang, set())
+
+        # Stage 1: Thu thập tất cả các node và phân cấp
+        file_skeletons = []
         
-        def traverse(node):
+        def traverse(node, current_parent=None):
             if node.type in target_types:
                 node_name = get_node_name(node, source_bytes)
                 node_text = source_bytes[node.start_byte:node.end_byte].decode('utf-8')
-                start_line = node.start_point.row + 1
-                end_line = node.end_point.row + 1
+                node_type = node.type.replace("_definition", "").replace("_declaration", "")
                 
-                chunks.append(AstChunk(
+                # Tạo chunk nội dung đầy đủ
+                chunk = AstChunk(
                     text=node_text,
-                    node_type=node.type.replace("_definition", "").replace("_declaration", ""),
+                    node_type=node_type,
                     node_name=node_name,
-                    start_line=start_line,
-                    end_line=end_line
-                ))
-            for child in node.children:
-                traverse(child)
+                    start_line=node.start_point.row + 1,
+                    end_line=node.end_point.row + 1,
+                    parent_name=current_parent
+                )
+                chunks.append(chunk)
+                
+                # Lưu chữ ký để làm skeleton
+                sig = get_signature(node, source_bytes)
+                file_skeletons.append((node_type, node_name, sig, current_parent))
+                
+                # Đệ quy vào con với parent mới
+                for child in node.children:
+                    traverse(child, current_parent=node_name)
+            else:
+                for child in node.children:
+                    traverse(child, current_parent=current_parent)
 
         traverse(tree.root_node)
-        
+
+        # Stage 2: Tạo Skeleton Nodes ("Mục lục") cho các Class/Interface
+        # Nhóm các signatures theo parent
+        skeletons_by_parent = {}
+        for n_type, n_name, sig, parent in file_skeletons:
+            if parent not in skeletons_by_parent:
+                skeletons_by_parent[parent] = []
+            skeletons_by_parent[parent].append(f"  - {n_type}: {sig}")
+
+        for parent, items in skeletons_by_parent.items():
+            if parent is None:
+                s_name = "Global Table of Contents"
+                s_type = "file_skeleton"
+            else:
+                s_name = f"{parent} Skeleton"
+                s_type = "class_skeleton"
+            
+            skeleton_text = f"Skeleton for {s_name}:\n" + "\n".join(items)
+            
+            chunks.append(AstChunk(
+                text=skeleton_text,
+                node_type=s_type,
+                node_name=s_name,
+                start_line=1,
+                end_line=1,
+                is_skeleton=True
+            ))
+
         if not chunks:
             chunks.append(AstChunk(
                 text=text,
@@ -103,9 +150,11 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
 
     # === [DEBUG_LOG_START] ===
     sys.stderr.write(f"\n=============================================\n")
-    sys.stderr.write(f"[Tree-sitter] Đã parse {len(chunks)} nodes từ file (lang={lang})\n")
+    sys.stderr.write(f"[Tree-sitter] Đã parse {len(chunks)} nodes (bao gồm Skeleton) từ file (lang={lang})\n")
     for c in chunks:
-        sys.stderr.write(f"  - {c.node_type}: {c.node_name} (L{c.start_line}-L{c.end_line})\n")
+        tag = " [SKELETON]" if c.is_skeleton else ""
+        parent = f" (parent: {c.parent_name})" if c.parent_name else ""
+        sys.stderr.write(f"  - {c.node_type}: {c.node_name}{parent}{tag}\n")
     sys.stderr.write(f"=============================================\n")
     sys.stderr.flush()
     # === [DEBUG_LOG_END] ===

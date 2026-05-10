@@ -92,8 +92,11 @@ class CodeEmbedding:
     start_line: int
     end_line: int
     is_test: bool    # True nếu file nằm trong thư mục test hoặc tên có _test/_spec
-    node_type: str   # class, function, file, ...
+    node_type: str   # class, function, file, skeleton, ...
     node_name: str   # Tên class/hàm
+    puid: str        # Project Unique ID (định danh ngữ nghĩa: file::class::node)
+    parent_puid: str # PUID của node cha (nếu có)
+    is_skeleton: bool # True nếu node chỉ chứa chữ ký (signatures) cho RAG reasoning
 
 
 # ─── Helper: phát hiện test file ─────────────────────────────────────────────
@@ -133,22 +136,36 @@ async def process_chunk(
     id_gen: IdGenerator,
     table: postgres.TableTarget[CodeEmbedding],
 ) -> None:
-    # Thêm prefix filename, node_type, node_name vào text trước khi embed để anchor ngữ cảnh
-    enriched_text = f"File: {filename}\nType: {chunk.node_type}\nName: {chunk.node_name}\n\n{chunk.text}"
+    # Thêm prefix vào text để embedding hiểu ngữ cảnh tốt hơn
+    parent_info = f"Parent: {chunk.parent_name}\n" if chunk.parent_name else ""
+    enriched_text = f"File: {filename}\n{parent_info}Type: {chunk.node_type}\nName: {chunk.node_name}\n\n{chunk.text}"
     embedding = await coco.use_context(EMBEDDER).embed(enriched_text)
+
+    # Tạo Semantic PUID
+    puid = f"{filename}::{chunk.node_name}"
+    parent_puid = f"{filename}::{chunk.parent_name}" if chunk.parent_name else ""
+
+    # === [DEBUG_LOG_START] ===
+    skeleton_tag = "[SKELETON]" if chunk.is_skeleton else "[CONTENT]"
+    sys.stderr.write(f"[INDEX] {skeleton_tag} PUID: {puid} | Parent: {chunk.parent_name or 'None'}\n")
+    sys.stderr.flush()
+    # === [DEBUG_LOG_END] ===
 
     table.declare_row(
         row=CodeEmbedding(
-            id=await id_gen.next_id(chunk.text),
+            id=await id_gen.next_id(f"{puid}:{chunk.is_skeleton}"), # ID duy nhất theo puid và loại node
             filename=str(filename),
             lang=lang,
-            text=chunk.text,          # lưu text gốc (không prefix) để hiển thị
+            text=chunk.text,
             embedding=embedding,
             start_line=chunk.start_line,
             end_line=chunk.end_line,
             is_test=is_test,
             node_type=chunk.node_type,
             node_name=chunk.node_name,
+            puid=puid,
+            parent_puid=parent_puid,
+            is_skeleton=chunk.is_skeleton
         )
     )
 
@@ -252,7 +269,7 @@ async def _search_async(
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name,
+                SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
                        1.0 - (embedding <=> $1) AS score
                 FROM "{PG_SCHEMA}"."{TABLE_NAME}"
                 ORDER BY score DESC
@@ -270,6 +287,10 @@ async def _search_async(
     sys.stderr.write(f"  - Tổng thời gian:      {total_duration:.4f}s\n")
     sys.stderr.write(f"  - Tạo Embedding:       {embed_duration:.4f}s\n")
     sys.stderr.write(f"  - Postgres Search:     {db_duration:.4f}s\n")
+    sys.stderr.write(f"\n[SEARCH_RESULTS] Top {len(rows)} nodes:\n")
+    for i, r in enumerate(rows):
+        skel_tag = "[SKELETON]" if r["is_skeleton"] else "[CONTENT]"
+        sys.stderr.write(f"  {i+1}. {skel_tag} {r['puid']} (score: {1.0 - (r['score']):.4f})\n")
     sys.stderr.write(f"=============================================\n")
     sys.stderr.flush()
     # === [DEBUG_LOG_END] ===
@@ -287,6 +308,9 @@ async def _search_async(
             "is_test":    r["is_test"],
             "node_type":  r["node_type"],
             "node_name":  r["node_name"],
+            "puid":       r["puid"],
+            "parent_puid": r["parent_puid"],
+            "is_skeleton": r["is_skeleton"],
         })
 
     return results

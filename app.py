@@ -300,14 +300,22 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                             end = meta.get("end_line", "?")
                             score = meta.get("score", 0)
                             is_test = meta.get("is_test", False)
+                            is_skeleton = meta.get("is_skeleton", False)
+                            puid = meta.get("puid", "")
                             node_type = meta.get("node_type", "")
                             node_name = meta.get("node_name", "")
-                            tag = " 🧪 TEST" if is_test else ""
+                            
+                            tag = ""
+                            if is_test: tag += " 🧪 TEST"
+                            if is_skeleton: tag += " 📖 SKELETON"
+
                             node_info = f" **[{node_type.upper()}: {node_name}]**" if node_type and node_name else ""
                             st.write(
                                 f"**[{idx+1}]** `{filename}`{node_info}  "
                                 f"L{start}–L{end}{tag}  *(score: {score:.3f})*"
                             )
+                            if puid:
+                                st.caption(f"PUID: `{puid}`")
                             st.code(
                                 d.page_content,
                                 language=meta.get("lang", ""),

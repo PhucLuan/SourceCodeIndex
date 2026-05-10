@@ -41,6 +41,9 @@ def query_cocoindex_db(
                     "is_test":    r["is_test"],
                     "node_type":  r.get("node_type", ""),
                     "node_name":  r.get("node_name", ""),
+                    "puid":       r.get("puid", ""),
+                    "parent_puid": r.get("parent_puid", ""),
+                    "is_skeleton": r.get("is_skeleton", False),
                 },
             )
             for r in results
@@ -102,12 +105,18 @@ Phân tích và trả lời bằng tiếng Việt hoặc tiếng Anh:"""
         is_test = meta.get("is_test", False)
         node_type = meta.get("node_type", "")
         node_name = meta.get("node_name", "")
+        puid = meta.get("puid", "")
+        is_skeleton = meta.get("is_skeleton", False)
+        
         tag = " [TEST FILE]" if is_test else ""
+        if is_skeleton:
+            tag += " [SKELETON/MỤC LỤC]"
 
         node_info = f" [{node_type.upper()}: {node_name}]" if node_type and node_name else ""
+        puid_info = f"\nPUID: {puid}" if puid else ""
 
         context_parts.append(
-            f"--- {filename}:L{start}-L{end}{node_info}{tag} (relevance: {score:.3f}) ---\n"
+            f"--- {filename}:L{start}-L{end}{node_info}{tag}{puid_info} (relevance: {score:.3f}) ---\n"
             f"{d.page_content}"
         )
 
