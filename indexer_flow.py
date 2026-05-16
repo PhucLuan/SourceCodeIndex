@@ -36,7 +36,7 @@ from numpy.typing import NDArray
 
 import cocoindex as coco
 from cocoindex.connectors import localfs, postgres
-from cocoindex.ops.text import detect_code_language
+from cocoindex.ops.text import detect_code_language, RecursiveSplitter
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from cocoindex.resources.id import IdGenerator
@@ -50,6 +50,15 @@ DATABASE_URL: str = os.environ["COCOINDEX_DATABASE_URL"]
 TABLE_NAME    = "code_embeddings"
 PG_SCHEMA     = "public"
 WORKSPACE_DIR = "/tmp/workspace"
+
+def get_workspace_subdir(original_src: str) -> str:
+    """Tạo tên thư mục đích duy nhất trong workspace dựa trên hash đường dẫn chuẩn hóa."""
+    import hashlib
+    # Chuẩn hóa: chữ thường, gạch chéo xuôi, bỏ gạch chéo cuối
+    normalized = original_src.replace("\\", "/").lower().rstrip("/")
+    path_hash = hashlib.md5(normalized.encode()).hexdigest()[:6]
+    folder_name = os.path.basename(normalized)
+    return f"{folder_name}_{path_hash}"
 TOP_K         = 10   # lấy nhiều hơn để re-rank bên app
 
 # Model tốt hơn cho semantic search (MTEB Retrieval benchmark)
@@ -66,12 +75,21 @@ EXCLUDED_PATTERNS = [
     "**/dist", "**/build",
     "**/.vs", "**/.vscode", "**/.idea",
     "**/*.min.js",      # minified JS không hữu ích
+    "**/*.min.css",     # minified CSS
+    "**/*.generated.ts",# code generated
+    "**/*.d.ts",        # typescript definitions (thường quá lớn và không chứa logic)
     "**/*.lock",        # lock files
     "**/migrations/**", # DB migrations thường không chứa logic hữu ích
+    "**/*.png", "**/*.jpg", "**/*.jpeg", "**/*.gif", "**/*.ico", # images
+    "**/*.woff", "**/*.woff2", "**/*.ttf", "**/*.eot",          # fonts
+    "**/*.pdf", "**/*.zip", "**/*.tar.gz", "**/*.rar",          # archives
 ]
 
 # Patterns RIÊNG cho test files — lưu dưới metadata "is_test" để filter khi query
 TEST_PATTERNS = {"test", "tests", "spec", "specs", "__tests__", "_test", ".test", ".spec"}
+
+# Ngôn ngữ hỗ trợ AST Parser (Tầng 1)
+SUPPORTED_AST_LANGS = {"python", "csharp", "c_sharp", "javascript", "js", "typescript", "ts", "tsx", "html", "css", "scss", "less"}
 
 
 # ─── Context keys ─────────────────────────────────────────────────────────────
@@ -81,6 +99,12 @@ EMBEDDER = coco.ContextKey[SentenceTransformerEmbedder]("embedder", detect_chang
 
 
 # ─── Schema ──────────────────────────────────────────────────────────────────
+
+def sanitize_for_pg(text: Optional[str]) -> str:
+    """Loại bỏ ký tự null byte (\x00) gây lỗi Postgres."""
+    if not text:
+        return ""
+    return text.replace("\x00", "")
 
 @dataclass
 class CodeEmbedding:
@@ -154,17 +178,17 @@ async def process_chunk(
     table.declare_row(
         row=CodeEmbedding(
             id=await id_gen.next_id(f"{puid}:{chunk.is_skeleton}"), # ID duy nhất theo puid và loại node
-            filename=str(filename),
+            filename=sanitize_for_pg(str(filename)),
             lang=lang,
-            text=chunk.text,
+            text=sanitize_for_pg(chunk.text),
             embedding=embedding,
             start_line=chunk.start_line,
             end_line=chunk.end_line,
             is_test=is_test,
-            node_type=chunk.node_type,
-            node_name=chunk.node_name,
-            puid=puid,
-            parent_puid=parent_puid,
+            node_type=sanitize_for_pg(chunk.node_type),
+            node_name=sanitize_for_pg(chunk.node_name),
+            puid=sanitize_for_pg(puid),
+            parent_puid=sanitize_for_pg(parent_puid),
             is_skeleton=chunk.is_skeleton
         )
     )
@@ -183,7 +207,24 @@ async def process_file(
     lang = detect_code_language(filename=str(filepath.name)) or ""
     is_test = _is_test_file(filepath)
 
-    chunks = extract_ast_nodes(text, lang)
+    if lang in SUPPORTED_AST_LANGS:
+        chunks = extract_ast_nodes(text, lang)
+    else:
+        # Tầng 2: Universal Fallback dùng RecursiveSplitter
+        from ast_chunker import AstChunk
+        splitter = RecursiveSplitter()
+        # RecursiveSplitter trong CocoIndex v1.x: tham số truyền vào hàm split()
+        text_chunks = await splitter.split(text, chunk_size=800, chunk_overlap=150)
+        chunks = []
+        for i, c in enumerate(text_chunks):
+            chunks.append(AstChunk(
+                text=c.text,
+                node_type="file_chunk",
+                node_name=f"chunk_{i}",
+                start_line=1, # Tạm thời để 1
+                end_line=max(1, c.text.count('\n') + 1)
+            ))
+
     id_gen = IdGenerator()
     await coco.map(
         process_chunk,
@@ -236,9 +277,15 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
         ),
     )
     # === [DEBUG_LOG_START] ===
+    # Chuyển đổi async generator sang list một cách an toàn
+    file_list = [item async for item in files.items()]
     sys.stderr.write(f"[DEBUG] app_main: sourcedir={sourcedir}\n")
+    sys.stderr.write(f"[DEBUG] app_main: Found {len(file_list)} files to process.\n")
+    for i, (path, _) in enumerate(file_list[:10]): # Log 10 file đầu tiên
+        sys.stderr.write(f"  - {i+1}. {path}\n")
+    sys.stderr.flush()
     # === [DEBUG_LOG_END] ===
-    await coco.mount_each(process_file, files.items(), target_table)
+    await coco.mount_each(process_file, file_list, target_table)
 
 
 # ─── App entry point ──────────────────────────────────────────────────────────
@@ -286,15 +333,29 @@ async def _search_async(
     # Xây dựng SQL filter nếu có source_filters
     filter_sql = ""
     if source_filters:
-        # source_filters là list các prefix đường dẫn (vd: /host_c/Project1)
-        # Vì path trong Docker đã được map, ta dùng LIKE hoặc so khớp prefix
+        # Chuyển đổi các nguồn được chọn sang đúng tên thư mục trong workspace (/tmp/workspace/Project_Hash)
+        mapped_filters = [f"{WORKSPACE_DIR}/{get_workspace_subdir(f)}" for f in source_filters]
+        
         conditions = []
-        for i, src in enumerate(source_filters):
+        for i, src in enumerate(mapped_filters):
             conditions.append(f"filename LIKE ${i+3} || '%'")
         filter_sql = "AND (" + " OR ".join(conditions) + ")"
+        # Cập nhật params cho SQL query
+        final_source_filters = mapped_filters
+    else:
+        final_source_filters = []
 
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         async with pool.acquire() as conn:
+            # === [DEBUG: Kiểm tra tổng số bản ghi và mẫu đường dẫn] ===
+            total_rows = await conn.fetchval(f'SELECT count(*) FROM "{PG_SCHEMA}"."{TABLE_NAME}"')
+            samples = await conn.fetch(f'SELECT filename FROM "{PG_SCHEMA}"."{TABLE_NAME}" LIMIT 3')
+            sys.stderr.write(f"[DEBUG] DB Total Rows: {total_rows}\n")
+            sys.stderr.write(f"[DEBUG] DB Filename Samples:\n")
+            for s in samples:
+                sys.stderr.write(f"  - {s['filename']}\n")
+            sys.stderr.flush()
+            
             query = f"""
                 SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
                        1.0 - (embedding <=> $1) AS score
@@ -303,10 +364,12 @@ async def _search_async(
                 ORDER BY score DESC
                 LIMIT $2
             """
-            # Tham số: $1: query_vec, $2: top_k, $3...: source_filters
             params = [str(query_vec.tolist()), top_k]
-            if source_filters:
-                params.extend(source_filters)
+            if final_source_filters:
+                params.extend(final_source_filters)
+            
+            sys.stderr.write(f"[DEBUG] SQL Filter: {filter_sql}\n")
+            sys.stderr.write(f"[DEBUG] Params (source filters): {final_source_filters}\n")
                 
             rows = await conn.fetch(query, *params)
 

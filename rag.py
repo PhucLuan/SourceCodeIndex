@@ -50,11 +50,14 @@ def query_cocoindex_db(
             for r in results
         ]
     except Exception as e:
+        # Nếu bảng chưa tồn tại (đang reset) hoặc lỗi DB, trả về rỗng thay vì crash
+        if "does not exist" in str(e).lower():
+            return []
         st.error(f"Lỗi khi query CocoIndex: {e}")
         return []
 
 
-def get_llm(llm_choice, model_name="qwen2.5:32b", api_key=None, ollama_host=None):
+def get_llm(llm_choice, model_name="gemma3:4b", api_key=None, ollama_host=None):
     if llm_choice == "Ollama":
         url = ollama_host or os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
         return OllamaLLM(model=model_name, base_url=url)

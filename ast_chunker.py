@@ -5,8 +5,10 @@ import tree_sitter_python
 import tree_sitter_c_sharp
 import tree_sitter_javascript
 import tree_sitter_typescript
+import tree_sitter_html
+import tree_sitter_css
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,20 @@ try:
 except Exception as e:
     logger.warning(f"Could not load tsx parser: {e}")
 
+try:
+    HTML_LANGUAGE = tree_sitter.Language(tree_sitter_html.language())
+    parsers["html"] = tree_sitter.Parser(HTML_LANGUAGE)
+except Exception as e:
+    logger.warning(f"Could not load html parser: {e}")
+
+try:
+    CSS_LANGUAGE = tree_sitter.Language(tree_sitter_css.language())
+    parsers["css"] = tree_sitter.Parser(CSS_LANGUAGE)
+    parsers["scss"] = parsers["css"]
+    parsers["less"] = parsers["css"]
+except Exception as e:
+    logger.warning(f"Could not load css parser: {e}")
+
 @dataclass
 class AstChunk:
     text: str
@@ -57,12 +73,39 @@ class AstChunk:
     references: List[str] = field(default_factory=list)
 
 def get_node_name(node, source_bytes: bytes) -> str:
-    """Lấy tên của node class hoặc function."""
+    """Lấy tên của node (class, function, arrow function, tag...)."""
+    # 1. Thử các field chuẩn
     for field_name in ['name', 'identifier']:
         name_node = node.child_by_field_name(field_name)
         if name_node:
             return source_bytes[name_node.start_byte:name_node.end_byte].decode('utf-8')
     
+    # 2. Xử lý Arrow Function (const name = () => ...)
+    # Thường arrow_function là con của variable_declarator
+    if node.type == 'arrow_function':
+        parent = node.parent
+        if parent and parent.type == 'variable_declarator':
+            id_node = parent.child_by_field_name('name')
+            if id_node:
+                return source_bytes[id_node.start_byte:id_node.end_byte].decode('utf-8')
+
+    # 3. Xử lý HTML Element
+    if node.type == 'element':
+        start_tag = node.child_by_field_name('start_tag')
+        if start_tag:
+            tag_name_node = start_tag.child_by_field_name('name')
+            if tag_name_node:
+                return f"<{source_bytes[tag_name_node.start_byte:tag_name_node.end_byte].decode('utf-8')}>"
+        return "<html>"
+
+    # 4. Xử lý CSS Rule Set
+    if node.type == 'rule_set':
+        selectors = node.child_by_field_name('selectors')
+        if selectors:
+            return source_bytes[selectors.start_byte:selectors.end_byte].decode('utf-8').strip()
+        return "css_rule"
+
+    # 5. Tìm con là identifier
     for child in node.children:
         if child.type == 'identifier':
             return source_bytes[child.start_byte:child.end_byte].decode('utf-8')
@@ -99,9 +142,13 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
             "python": {"class_definition", "function_definition"},
             "c_sharp": {"class_declaration", "method_declaration", "interface_declaration", "enum_declaration", "struct_declaration"},
             "csharp": {"class_declaration", "method_declaration", "interface_declaration", "enum_declaration", "struct_declaration"},
-            "javascript": {"class_declaration", "function_declaration", "method_definition"},
-            "typescript": {"class_declaration", "function_declaration", "method_definition", "interface_declaration", "enum_declaration"},
-            "tsx": {"class_declaration", "function_declaration", "method_definition", "interface_declaration", "enum_declaration"}
+            "javascript": {"class_declaration", "function_declaration", "method_definition", "arrow_function"},
+            "typescript": {"class_declaration", "function_declaration", "method_definition", "interface_declaration", "enum_declaration", "arrow_function", "type_alias_declaration"},
+            "tsx": {"class_declaration", "function_declaration", "method_definition", "interface_declaration", "enum_declaration", "arrow_function", "type_alias_declaration"},
+            "html": {"element"},
+            "css": {"rule_set"},
+            "scss": {"rule_set"},
+            "less": {"rule_set"}
         }.get(lang, set())
 
         # Stage 1: Thu thập tất cả các node và phân cấp
@@ -110,7 +157,28 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
         def traverse(node, current_parent=None):
             if node.type in target_types:
                 node_name = get_node_name(node, source_bytes)
-                node_text = source_bytes[node.start_byte:node.end_byte].decode('utf-8')
+                
+                # Bắt đầu và kết thúc mặc định
+                start_byte = node.start_byte
+                end_byte = node.end_byte
+                
+                # 1. Xử lý export_statement (TS/JS)
+                if node.parent and node.parent.type == 'export_statement':
+                    start_byte = node.parent.start_byte
+                
+                # 2. Xử lý Decorators (Angular/TS)
+                # Decorators thường nằm ngay trước node hoặc là con của node tùy version parser
+                # Chúng ta sẽ kiểm tra các anh em đứng trước nếu chúng là decorator
+                prefix_text = ""
+                prev = node.prev_sibling
+                while prev and prev.type == 'decorator':
+                    prefix_text = source_bytes[prev.start_byte:prev.end_byte].decode('utf-8') + "\n" + prefix_text
+                    # Nếu decorator đứng trước, ta mở rộng start_byte
+                    if prev.start_byte < start_byte:
+                        start_byte = prev.start_byte
+                    prev = prev.prev_sibling
+
+                node_text = source_bytes[start_byte:end_byte].decode('utf-8')
                 node_type = node.type.replace("_definition", "").replace("_declaration", "")
                 
                 # Tạo chunk nội dung đầy đủ
