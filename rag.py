@@ -15,20 +15,106 @@ from langchain_core.prompts import PromptTemplate
 
 import streamlit as st
 
-from indexer_flow import search as _search
+from indexer_flow import search as _search, fetch_nodes
 
+
+SCORE_THRESHOLD = 0.3
+
+def expand_query(query_text: str, llm) -> list[str]:
+    """Sử dụng LLM để tạo ra các biến thể kỹ thuật của câu hỏi giúp tăng recall."""
+    if not llm:
+        return [query_text]
+    
+    prompt = f"""Bạn là một chuyên gia tìm kiếm mã nguồn. 
+Hãy tạo ra 2-3 biến thể ngắn gọn của câu hỏi sau bằng tiếng Anh và tiếng Việt, tập trung vào các từ khóa kỹ thuật (class, method, API, logic).
+Chỉ trả về danh sách các biến thể, mỗi biến thể một dòng, không giải thích.
+
+Câu hỏi: {query_text}"""
+    
+    try:
+        response = llm.invoke(prompt)
+        variants = [v.strip("- ").strip() for v in response.split("\n") if v.strip()]
+        queries = [query_text] + variants[:3]
+        
+        # === [DEBUG_LOG] ===
+        sys.stderr.write(f"\n[QUERY_EXPANSION] Gốc: '{query_text}'\n")
+        for i, q in enumerate(queries[1:]):
+            sys.stderr.write(f"  - Biến thể {i+1}: '{q}'\n")
+        sys.stderr.flush()
+        
+        return queries
+    except Exception as e:
+        sys.stderr.write(f"[WARNING] Query expansion failed: {e}\n")
+        return [query_text]
 
 def query_cocoindex_db(
     query_text: str,
     top_k: int = 8,
     source_filters: list[str] = None,
+    llm = None,
+    similarity_threshold: float = 0.3,
+    use_query_expansion: bool = True,
 ) -> list[Document]:
     """
-    Semantic search dùng indexer_flow.search() với pgvector cosine similarity.
-    Dựa vào AST-enriched embeddings để tự động phân biệt logic/test.
+    Semantic search nâng cao:
+    1. Query Expansion (nếu có LLM và được bật)
+    2. Over-fetch (top_k * 2)
+    3. Score Threshold filtering (dynamic)
+    4. Loại bỏ trùng lặp
     """
     try:
-        results = _search(query_text, top_k=top_k, source_filters=source_filters)
+        # 1. Query Expansion
+        queries = expand_query(query_text, llm) if (llm and use_query_expansion) else [query_text]
+        
+        all_results = []
+        seen_puids = set()
+        
+        # 2. Over-fetch cho mỗi query (lấy dư để filter)
+        search_limit = top_k * 2
+        rejected_count = 0
+        
+        sys.stderr.write(f"\n[RETRIEVAL_START] Processing {len(queries)} queries...\n")
+        for idx, q in enumerate(queries):
+            results = _search(q, top_k=search_limit, source_filters=source_filters)
+            count_valid = 0
+            for r in results:
+                # 3. Score Threshold (Cosine Similarity)
+                if r["score"] < similarity_threshold:
+                    rejected_count += 1
+                    continue
+                
+                # 4. De-duplicate by PUID
+                puid = r.get("puid", "")
+                if puid not in seen_puids:
+                    all_results.append(r)
+                    seen_puids.add(puid)
+                    count_valid += 1
+            sys.stderr.write(f"  - Query {idx}: '{q[:50]}...' -> Found {len(results)} total, {count_valid} new above threshold.\n")
+        
+        # Lưu số lượng bị loại vào session state để hiển thị trên UI
+        st.session_state.rejected_count = rejected_count
+        
+        # Sắp xếp lại theo score giảm dần sau khi gộp
+        all_results.sort(key=lambda x: x["score"], reverse=True)
+        
+        # Lấy lại đúng số lượng top_k yêu cầu
+        final_results = all_results[:top_k]
+        
+        # --- Giai đoạn 5: Context Enrichment (Skeleton Retrieval) ---
+        # Nếu kết quả là method/function, ta lấy thêm Skeleton của Class cha hoặc File
+        enriched_results = list(final_results)
+        parent_puids = {r["parent_puid"] for r in final_results if r.get("parent_puid")}
+        
+        # Lọc các PUID chưa có trong kết quả hiện tại
+        puids_to_fetch = [p for p in parent_puids if p not in seen_puids]
+        
+        if puids_to_fetch:
+            skeletons = fetch_nodes(puids_to_fetch, is_skeleton=True)
+            for skel in skeletons:
+                # Gán score cố định để đánh dấu đây là context bổ trợ
+                skel["score"] = 0.99 
+                enriched_results.append(skel)
+                seen_puids.add(skel["puid"])
         
         return [
             Document(
@@ -47,13 +133,14 @@ def query_cocoindex_db(
                     "is_skeleton": r.get("is_skeleton", False),
                 },
             )
-            for r in results
+            for r in enriched_results
         ]
     except Exception as e:
-        # Nếu bảng chưa tồn tại (đang reset) hoặc lỗi DB, trả về rỗng thay vì crash
         if "does not exist" in str(e).lower():
             return []
         st.error(f"Lỗi khi query CocoIndex: {e}")
+        import logging
+        logging.getLogger(__name__).error(f"Search Error: {e}", exc_info=True)
         return []
 
 

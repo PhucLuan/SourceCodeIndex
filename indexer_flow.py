@@ -214,7 +214,7 @@ async def process_file(
         from ast_chunker import AstChunk
         splitter = RecursiveSplitter()
         # RecursiveSplitter trong CocoIndex v1.x: tham số truyền vào hàm split()
-        text_chunks = await splitter.split(text, chunk_size=800, chunk_overlap=150)
+        text_chunks = splitter.split(text, chunk_size=800, chunk_overlap=150)
         chunks = []
         for i, c in enumerate(text_chunks):
             chunks.append(AstChunk(
@@ -384,7 +384,8 @@ async def _search_async(
     sys.stderr.write(f"\n[SEARCH_RESULTS] Top {len(rows)} nodes:\n")
     for i, r in enumerate(rows):
         skel_tag = "[SKELETON]" if r["is_skeleton"] else "[CONTENT]"
-        sys.stderr.write(f"  {i+1}. {skel_tag} {r['puid']} (score: {1.0 - (r['score']):.4f})\n")
+        # r['score'] đã là 1.0 - distance (Similarity)
+        sys.stderr.write(f"  {i+1}. {skel_tag} {r['puid']} (similarity: {r['score']:.4f})\n")
     sys.stderr.write(f"=============================================\n")
     sys.stderr.flush()
     # === [DEBUG_LOG_END] ===
@@ -408,6 +409,64 @@ async def _search_async(
         })
 
     return results
+
+
+async def fetch_nodes_by_puid(
+    puids: List[str],
+    is_skeleton: Optional[bool] = None
+) -> list[dict]:
+    """Lấy trực tiếp các node theo danh sách PUID (thường dùng để lấy Skeleton)."""
+    if not puids:
+        return []
+        
+    query = f"""
+        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
+               1.0 AS score
+        FROM "{PG_SCHEMA}"."{TABLE_NAME}"
+        WHERE puid = ANY($1)
+    """
+    if is_skeleton is not None:
+        query += f" AND is_skeleton = {is_skeleton}"
+
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, puids)
+
+    results = []
+    for r in rows:
+        results.append({
+            "filename":   r["filename"],
+            "lang":       r["lang"],
+            "text":       r["text"],
+            "score":      float(r["score"]),
+            "start_line": r["start_line"],
+            "end_line":   r["end_line"],
+            "is_test":    r["is_test"],
+            "node_type":  r["node_type"],
+            "node_name":  r["node_name"],
+            "puid":       r["puid"],
+            "parent_puid": r["parent_puid"],
+            "is_skeleton": r["is_skeleton"],
+        })
+    return results
+
+
+def fetch_nodes(
+    puids: List[str],
+    is_skeleton: Optional[bool] = None
+) -> list[dict]:
+    """Sync wrapper cho fetch_nodes_by_puid."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    return loop.run_until_complete(fetch_nodes_by_puid(puids, is_skeleton))
 
 
 def search(

@@ -275,6 +275,19 @@ with st.sidebar:
     st.write("---")
     st.subheader("3. Tuỳ chỉnh Tìm kiếm")
     top_k = st.slider("Số context chunks:", min_value=3, max_value=20, value=8)
+    similarity_threshold = st.slider(
+        "Similarity Threshold (Ngưỡng lọc):",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.30,
+        step=0.05,
+        help="Loại bỏ các chunk có Cosine Similarity nhỏ hơn ngưỡng này để giảm thiểu noise."
+    )
+    use_query_expansion = st.checkbox(
+        "Bật Query Expansion",
+        value=True,
+        help="Sử dụng LLM để tạo các biến thể câu hỏi (tăng khả năng tìm thấy code)."
+    )
 
     # --- Source Filter ---
     st.write("---")
@@ -315,24 +328,35 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
 
         with st.chat_message("assistant"):        # 1. Search
             with st.spinner("Đang tìm kiếm ngữ cảnh..."):
+                try:
+                    llm = get_llm(
+                        llm_choice,
+                        model_name=model_name,
+                        api_key=api_key,
+                        ollama_host=ollama_host,
+                    )
+                except Exception as e:
+                    st.error(f"❌ Lỗi khởi tạo LLM: {e}")
+                    st.stop()
+
                 docs = query_cocoindex_db(
                     query, 
                     top_k=top_k,
-                    source_filters=search_sources_selection
+                    source_filters=search_sources_selection,
+                    llm=llm,
+                    similarity_threshold=similarity_threshold,
+                    use_query_expansion=use_query_expansion
                 )
 
+                if "rejected_count" in st.session_state and st.session_state.rejected_count > 0:
+                    st.info(f"ℹ️ Đã lọc bỏ {st.session_state.rejected_count} chunks có độ tương đồng < {similarity_threshold:.2f}")
+
                 if not docs:
-                    response = "Không tìm thấy thông tin phù hợp trong các Project đã chọn. Đảm bảo bạn đã Index các project này."
+                    response = "Không tìm thấy thông tin phù hợp trong các Project đã chọn. Đảm bảo bạn đã Index các project này hoặc giảm Similarity Threshold."
                     st.markdown(response)
                     st.session_state.messages.append({"role": "assistant", "content": response})
                 else:
                     try:
-                        llm = get_llm(
-                            llm_choice,
-                            model_name=model_name,
-                            api_key=api_key,
-                            ollama_host=ollama_host,
-                        )
                         stream_gen = generate_answer_stream(query, docs, llm)
                         response = st.write_stream(stream_gen)
                         st.session_state.messages.append({"role": "assistant", "content": response})
@@ -341,6 +365,15 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                             for idx, d in enumerate(docs):
                                 meta = d.metadata
                                 filename = meta.get("filename", "?")
+                                # Rút gọn đường dẫn hiển thị (bỏ /tmp/workspace/project_hash/)
+                                display_filename = filename
+                                if filename.startswith("/tmp/workspace/"):
+                                    parts = filename.replace("/tmp/workspace/", "").split("/", 1)
+                                    if len(parts) > 1:
+                                        display_filename = parts[1]
+                                    else:
+                                        display_filename = parts[0]
+
                                 start = meta.get("start_line", "?")
                                 end = meta.get("end_line", "?")
                                 score = meta.get("score", 0)
@@ -354,10 +387,21 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                                 if is_test: tag += " 🧪 TEST"
                                 if is_skeleton: tag += " 📖 SKELETON"
 
+                                # Định dạng màu sắc/icon theo score
+                                if score >= 0.7:
+                                    score_icon = "🟢"
+                                    score_desc = "High relevance"
+                                elif score >= 0.5:
+                                    score_icon = "🟡"
+                                    score_desc = "Medium relevance"
+                                else:
+                                    score_icon = "🔴"
+                                    score_desc = "Low relevance"
+
                                 node_info = f" **[{node_type.upper()}: {node_name}]**" if node_type and node_name else ""
                                 st.write(
-                                    f"**[{idx+1}]** `{filename}`{node_info}  "
-                                    f"L{start}–L{end}{tag}  *(score: {score:.3f})*"
+                                    f"**[{idx+1}]** `{display_filename}`{node_info}  "
+                                    f"L{start}–L{end}{tag}  ·  {score_icon} **{score_desc}** *({score:.3f})*"
                                 )
                                 if puid:
                                     st.caption(f"PUID: `{puid}`")
