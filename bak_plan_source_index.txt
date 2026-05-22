@@ -1,0 +1,44 @@
+Chào bạn, dựa trên mã nguồn hiện tại (indexer_flow.py, app.py, rag.py) và các tài liệu từ CocoIndex / cocoindex-code mà bạn cung cấp, tôi xin đánh giá mức độ hoàn thiện của hệ thống dựa trên 5 quan điểm của bạn như sau:
+
+Đánh giá hiện trạng ứng dụng (Dựa trên 5 tiêu chí)
+1. Ứng dụng đã có thể indexing bằng các sử dụng các thuật toán hiện đại như Tree-sitter chưa?
+Trạng thái: ❌ Chưa thỏa mãn.
+Hiện trạng: Trong file indexer_flow.py, bạn đang sử dụng RecursiveSplitter (import từ cocoindex.ops.text) với chunk_size=1500 và chunk_overlap=300. Đây là phương pháp chia văn bản thô đệ quy, hoàn toàn chưa sử dụng các thuật toán phân tích cú pháp Abstract Syntax Tree (AST) hay Tree-sitter.
+2. Đã có thể tích hợp với CocoInsight để quan sát quá trình index một cách trực quan chưa?
+Trạng thái: ❌ Chưa thỏa mãn.
+Hiện trạng: Bạn đã tự xây dựng một giao diện bằng Streamlit (app.py), nhưng đây là UI tự thiết kế chứ không phải CocoInsight (công cụ tracing/monitoring built-in của CocoIndex giúp xem chi tiết các Flow, DataScope và quá trình transform dữ liệu). Mã nguồn hiện tại không có thiết lập nào để bật tính năng theo dõi (telemetry) của CocoInsight.
+3. Chunking tối ưu cho việc hiểu ngữ cảnh (biểu hiện sự liên quan giữa class, tham chiếu, namespace) thay vì chunking cố định?
+Trạng thái: ❌ Chưa thỏa mãn.
+Hiện trạng: Do đang dùng RecursiveSplitter, code của bạn vẫn bị chia nhỏ dựa trên số lượng token/ký tự cố định. Nó có thể cắt ngang một hàm (function) ở giữa chừng hoặc gộp 2 class không liên quan vào cùng một chunk nếu chúng nằm gần nhau. Nó không nhận diện được đâu là biến, đâu là hàm, hay mối quan hệ kế thừa/gọi chéo giữa các class.
+4. Đã bao gồm các metadata của mã nguồn để giúp truy xuất chính xác hơn?
+Trạng thái: ⚠️ Thỏa mãn một phần (Tốt nhưng chưa đủ cho cấp độ AST).
+Hiện trạng: Bạn đã làm rất tốt việc đính kèm các metadata cơ bản như filename, lang, start_line, end_line và cờ is_test. Bạn cũng đã ghép filename vào nội dung chunk trước khi embedding (enriched_text). Điều này giúp LLM và search engine có ngữ cảnh "đang ở file nào". Tuy nhiên, thiếu vắng hoàn toàn metadata đặc thù của code (ví dụ: node_type = "class"|"function", parent_namespace, dependencies).
+5. AST-based semantic code search (tìm nội dung liên quan nhất chứ không phải tương đồng nhất)?
+Trạng thái: ❌ Chưa thỏa mãn.
+Hiện trạng: Câu lệnh SQL trong _search_async của bạn chỉ đang thực hiện một lệnh tìm kiếm dựa trên Vector Similarity (độ tương đồng Cosine embedding <=> $1). Tìm kiếm tương đồng vector thuần túy chỉ giúp tìm ra "đoạn code nào mô tả giống với câu hỏi nhất", chứ không thể suy luận ra "hàm A này gọi đến hàm B, nên hàm B cũng rất liên quan" (Code Graph Traversal).
+📝 Todo List để đạt được mục tiêu
+Vì bạn đang ở giai đoạn điều tra và lên kế hoạch (không cần code ngay), dưới đây là lộ trình công việc (Todo list) cần thực hiện:
+
+Phase 1: Chuyển đổi sang AST-based Indexing (cocoindex-code)
+
+[ ] Tìm hiểu và Cài đặt cocoindex-code: Thư viện này chứa các công cụ xử lý AST và tạo Code Graph. (Phải kiểm tra tài liệu cụ thể của repo này để xem cách import Tree-sitter parsers).
+[ ] Thay thế RecursiveSplitter: Bỏ cách chunking theo độ dài hiện tại. Chuyển sang sử dụng các Transform Flows dựa trên AST (như SplitByNode, ExtractClass, ExtractFunction).
+[ ] Tái cấu trúc Database Schema: Bổ sung thêm các trường metadata cho DB (Postgres/PGVector):
+node_type (Enum: Class, Function, Interface, Variable...).
+node_name (Tên hàm, tên class).
+namespace_or_scope (Nằm trong module/package nào).
+Phase 2: Xây dựng Code Graph & Relationships (Tham chiếu, kế thừa)
+
+[ ] Trích xuất References: Sử dụng module AST để lấy ra danh sách các lời gọi hàm (function calls) và class tham chiếu (imports/inheritances) bên trong mỗi Node.
+[ ] Lưu trữ Quan hệ (Edges): Lưu lại cấu trúc đồ thị (Node A phụ thuộc Node B) bằng cách gắn PUID/PGID (như tài liệu cocoindex-code nhắc đến) để định danh duy nhất cho từng function/class trên toàn bộ codebase.
+Phase 3: Nâng cấp Semantic Search (Graph-augmented RAG)
+
+[ ] Cải tiến thuật toán tìm kiếm (search_async):
+Đầu tiên, dùng Vector Search để tìm ra "Node điểm vào" (EntryPoint).
+Sau đó, dùng Metadata/Code Graph (danh sách ID tham chiếu) để kéo thêm toàn bộ các "Node liên quan" (Ví dụ: kéo định nghĩa của các Interface mà Class này đang implements).
+[ ] Thiết kế lại prompt LLM (rag.py): Đưa cho LLM không chỉ danh sách các đoạn code, mà là một "sơ đồ" rõ ràng: "Đây là class A. Class A gọi các hàm B và C bên dưới...".
+Phase 4: Cấu hình CocoInsight & Tối ưu
+
+[ ] Kích hoạt CocoInsight: Tích hợp đoạn mã cocoindex.init() hoặc sử dụng CLI cocoindex run thay cho việc gọi app_main ngầm, qua đó giao diện CocoInsight (tracing UI) sẽ tự động sinh ra giúp bạn theo dõi quá trình build index dạng đồ thị (Flow graph) thay vì chỉ in log đen trắng.
+[ ] Phơi bày (Expose) Port UI: Cấu hình file docker-compose.yml để mở port của CocoInsight UI ra ngoài host máy tính.
+Bạn có muốn tôi đi sâu vào việc lập kế hoạch chi tiết cho một Phase cụ thể (ví dụ Phase 1: cách tích hợp Tree-sitter vào Code_Embedding Flow) dựa trên cấu trúc API của CocoIndex không?

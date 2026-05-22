@@ -20,13 +20,17 @@ import pathlib
 
 from indexer_flow import app as coco_app
 from rag import query_cocoindex_db, get_llm, generate_answer_stream
+from embedder_config import load_active_profile, save_active_profile, DEFAULT_PROFILES
 
 st.set_page_config(page_title="Source Code Indexer", page_icon="🔍", layout="wide")
 
 SOURCES_FILE = "sources.json"
 WORKSPACE_DIR = "/tmp/workspace"
-TABLE_NAME    = "code_embeddings"
 PG_SCHEMA     = "public"
+
+# Lấy động table_name từ active profile
+_active_profile = load_active_profile()
+TABLE_NAME    = _active_profile.table_name
 
 
 def load_sources() -> list[str]:
@@ -167,6 +171,40 @@ with st.sidebar:
             else:
                 st.warning("Source đã tồn tại.")
 
+    # --- Embedding Model ---
+    st.write("---")
+    st.subheader("1.5. Embedding Model (Bản đồ Vector)")
+    
+    act_prof = load_active_profile()
+    profile_keys = list(DEFAULT_PROFILES.keys())
+    profile_names = [DEFAULT_PROFILES[k].display_name for k in profile_keys]
+    
+    try:
+        active_index = profile_keys.index(act_prof.name)
+    except ValueError:
+        active_index = 0
+        
+    selected_name = st.selectbox(
+        "Chọn mô hình nhúng (Embedding):",
+        options=profile_names,
+        index=active_index,
+        help="Đổi mô hình yêu cầu phải chạy 'Reset Selected' hoặc re-index lại từ đầu để tránh lỗi mismatch vector."
+    )
+    
+    selected_key = profile_keys[profile_names.index(selected_name)]
+    selected_profile = DEFAULT_PROFILES[selected_key]
+    
+    st.caption(f"**Model ID:** `{selected_profile.model_id}`")
+    st.caption(f"**Bảng DB:** `{selected_profile.table_name}` · **Context:** {selected_profile.max_tokens} tokens")
+    st.info(selected_profile.description)
+    
+    if selected_profile.name != act_prof.name:
+        st.warning("⚠️ Bạn đã thay đổi Embedding Model! Bạn bắt buộc phải chạy 'Reset Selected' để xóa và nhúng lại mã nguồn bằng model mới.")
+        if st.button("🔄 Xác nhận & Lưu cấu hình model", use_container_width=True):
+            save_active_profile(selected_profile)
+            st.success("Đã lưu cấu hình mới! Hãy nhấn nút Reset bên dưới để re-index.")
+            st.rerun()
+
     # --- File Filtering ---
     st.write("---")
     st.subheader("Lọc File & Thư mục")
@@ -218,13 +256,20 @@ with st.sidebar:
                             # RESET SELECTED: Xóa dữ liệu cũ của các nguồn được chọn
                             try:
                                 conn = await asyncpg.connect(db_url)
+                                from embedder_config import load_active_profile
+                                act_prof = load_active_profile()
                                 for src_path in active_sources:
-                                    mapped_path = _map_windows_path(src_path)
+                                    dst_name = get_workspace_subdir(src_path)
+                                    db_prefix = f"{WORKSPACE_DIR}/{dst_name}/"
                                     st.write(f"Đang làm sạch: `{src_path}`...")
-                                    await conn.execute(
-                                        f'DELETE FROM "{PG_SCHEMA}"."{TABLE_NAME}" WHERE filename LIKE $1',
-                                        f"{mapped_path}%"
-                                    )
+                                    try:
+                                        await conn.execute(
+                                            f'DELETE FROM "{PG_SCHEMA}"."{act_prof.table_name}" WHERE filename LIKE $1',
+                                            f"{db_prefix}%"
+                                        )
+                                    except asyncpg.exceptions.UndefinedTableError:
+                                        # Bảng chưa được khởi tạo, bỏ qua
+                                        pass
                                 await conn.close()
                                 # Dọn dẹp cache cocoindex nếu cần
                                 try:

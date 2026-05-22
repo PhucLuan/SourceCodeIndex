@@ -1,0 +1,19 @@
+{
+    "name": "code",
+    "display_name": "Code — nomic-embed-text-v1.5 (Mặc định)",
+    "model_id": "nomic-ai/nomic-embed-text-v1.5",
+    "table_name": "code_embeddings",
+    "source_extensions": [
+        "py",
+        "ts",
+        "tsx",
+        "js",
+        "cs",
+        "html",
+        "css",
+        "scss",
+        "less"
+    ],
+    "description": "Mô hình nhúng dài 8192 tokens chuẩn Native ổn định, chạy mượt trên CPU.",
+    "max_tokens": 8192
+}

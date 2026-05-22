@@ -30,8 +30,12 @@ import time
 from dataclasses import dataclass
 from typing import Annotated, AsyncIterator
 
+MAX_EMBED_CONCURRENCY = int(os.getenv("MAX_EMBED_CONCURRENCY", "8"))
+_embed_sem = asyncio.Semaphore(MAX_EMBED_CONCURRENCY)
+
 import asyncpg
 import numpy as np
+
 from numpy.typing import NDArray
 
 import cocoindex as coco
@@ -47,9 +51,13 @@ from ast_chunker import extract_ast_nodes
 # ─── Cấu hình ────────────────────────────────────────────────────────────────
 
 DATABASE_URL: str = os.environ["COCOINDEX_DATABASE_URL"]
-TABLE_NAME    = "code_embeddings"
 PG_SCHEMA     = "public"
 WORKSPACE_DIR = "/tmp/workspace"
+
+from embedder_config import load_active_profile
+_active_profile = load_active_profile()
+TABLE_NAME    = _active_profile.table_name
+EMBED_MODEL   = _active_profile.model_id
 
 def get_workspace_subdir(original_src: str) -> str:
     """Tạo tên thư mục đích duy nhất trong workspace dựa trên hash đường dẫn chuẩn hóa."""
@@ -60,10 +68,6 @@ def get_workspace_subdir(original_src: str) -> str:
     folder_name = os.path.basename(normalized)
     return f"{folder_name}_{path_hash}"
 TOP_K         = 10   # lấy nhiều hơn để re-rank bên app
-
-# Model tốt hơn cho semantic search (MTEB Retrieval benchmark)
-# all-mpnet-base-v2: 57.0 NDCG@10 vs all-MiniLM-L6-v2: 49.2
-EMBED_MODEL = "sentence-transformers/all-mpnet-base-v2"
 
 # Patterns thư mục/file cần loại khỏi index
 EXCLUDED_PATTERNS = [
@@ -89,7 +93,7 @@ EXCLUDED_PATTERNS = [
 TEST_PATTERNS = {"test", "tests", "spec", "specs", "__tests__", "_test", ".test", ".spec"}
 
 # Ngôn ngữ hỗ trợ AST Parser (Tầng 1)
-SUPPORTED_AST_LANGS = {"python", "csharp", "c_sharp", "javascript", "js", "typescript", "ts", "tsx", "html", "css", "scss", "less"}
+SUPPORTED_AST_LANGS = {"python", "csharp", "c_sharp", "javascript", "js", "typescript", "ts", "tsx"}
 
 
 # ─── Context keys ─────────────────────────────────────────────────────────────
@@ -145,7 +149,12 @@ def _is_test_file(filepath: pathlib.PurePath) -> bool:
 async def coco_lifespan(builder: coco.EnvironmentBuilder) -> AsyncIterator[None]:
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         builder.provide(PG_DB, pool)
-        builder.provide(EMBEDDER, SentenceTransformerEmbedder(EMBED_MODEL))
+        from embedder_config import load_active_profile
+        act_prof = load_active_profile()
+        sys.stderr.write(f"[LIFESPAN] Đang khởi tạo Embedder với model: {act_prof.model_id}\n")
+        sys.stderr.flush()
+        # Pass trust_remote_code flag if the model requires it
+        builder.provide(EMBEDDER, SentenceTransformerEmbedder(act_prof.model_id, trust_remote_code=act_prof.trust_remote_code))
         yield
 
 
@@ -160,10 +169,14 @@ async def process_chunk(
     id_gen: IdGenerator,
     table: postgres.TableTarget[CodeEmbedding],
 ) -> None:
-    # Thêm prefix vào text để embedding hiểu ngữ cảnh tốt hơn
+    # Thêm prefix vào text để embedding hiểu ngữ cảnh tốt hơn (sử dụng profile.document_prefix)
+    from embedder_config import load_active_profile
+    _prof = load_active_profile()
+    prefix = _prof.document_prefix or ""
     parent_info = f"Parent: {chunk.parent_name}\n" if chunk.parent_name else ""
-    enriched_text = f"File: {filename}\n{parent_info}Type: {chunk.node_type}\nName: {chunk.node_name}\n\n{chunk.text}"
-    embedding = await coco.use_context(EMBEDDER).embed(enriched_text)
+    enriched_text = f"{prefix}File: {filename}\n{parent_info}Type: {chunk.node_type}\nName: {chunk.node_name}\n\n{chunk.text}"
+    async with _embed_sem:
+        embedding = await coco.use_context(EMBEDDER).embed(enriched_text)
 
     # Tạo Semantic PUID
     puid = f"{filename}::{chunk.node_name}"
@@ -210,7 +223,6 @@ async def process_file(
     if lang in SUPPORTED_AST_LANGS:
         chunks = extract_ast_nodes(text, lang)
     else:
-        # Tầng 2: Universal Fallback dùng RecursiveSplitter
         from ast_chunker import AstChunk
         splitter = RecursiveSplitter()
         # RecursiveSplitter trong CocoIndex v1.x: tham số truyền vào hàm split()
@@ -239,6 +251,9 @@ async def process_file(
 
 @coco.fn
 async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+    
     table_schema = await postgres.TableSchema.from_class(
         CodeEmbedding,
         primary_key=["id"],
@@ -246,7 +261,7 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
     try:
         target_table = await postgres.mount_table_target(
             PG_DB,
-            table_name=TABLE_NAME,
+            table_name=act_prof.table_name,
             table_schema=table_schema,
             pg_schema_name=PG_SCHEMA,
         )
@@ -261,7 +276,7 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
             # Nếu mount thất bại vì bảng đã có, ta thử lấy lại target mà không tạo mới
             target_table = await postgres.mount_table_target(
                 PG_DB,
-                table_name=TABLE_NAME,
+                table_name=act_prof.table_name,
                 table_schema=table_schema,
                 pg_schema_name=PG_SCHEMA,
             )
@@ -311,8 +326,15 @@ async def _search_async(
     total_start = time.perf_counter()
     # === [DEBUG_LOG_END] ===
 
-    embedder = SentenceTransformerEmbedder(EMBED_MODEL)
-    enriched_query = f"Code search query: {query_text}"
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+
+    embedder = SentenceTransformerEmbedder(act_prof.model_id)
+    # Load profile để lấy query_prefix (có thể rỗng)
+    from embedder_config import load_active_profile
+    _prof = load_active_profile()
+    query_prefix = _prof.query_prefix or ""
+    enriched_query = f"{query_prefix}{query_text}"
     
     # --- Giai đoạn 1: Tạo Embedding ---
     # === [DEBUG_LOG_START] ===
@@ -348,8 +370,8 @@ async def _search_async(
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         async with pool.acquire() as conn:
             # === [DEBUG: Kiểm tra tổng số bản ghi và mẫu đường dẫn] ===
-            total_rows = await conn.fetchval(f'SELECT count(*) FROM "{PG_SCHEMA}"."{TABLE_NAME}"')
-            samples = await conn.fetch(f'SELECT filename FROM "{PG_SCHEMA}"."{TABLE_NAME}" LIMIT 3')
+            total_rows = await conn.fetchval(f'SELECT count(*) FROM "{PG_SCHEMA}"."{act_prof.table_name}"')
+            samples = await conn.fetch(f'SELECT filename FROM "{PG_SCHEMA}"."{act_prof.table_name}" LIMIT 3')
             sys.stderr.write(f"[DEBUG] DB Total Rows: {total_rows}\n")
             sys.stderr.write(f"[DEBUG] DB Filename Samples:\n")
             for s in samples:
@@ -359,7 +381,7 @@ async def _search_async(
             query = f"""
                 SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
                        1.0 - (embedding <=> $1) AS score
-                FROM "{PG_SCHEMA}"."{TABLE_NAME}"
+                FROM "{PG_SCHEMA}"."{act_prof.table_name}"
                 WHERE 1=1 {filter_sql}
                 ORDER BY score DESC
                 LIMIT $2
@@ -419,10 +441,13 @@ async def fetch_nodes_by_puid(
     if not puids:
         return []
         
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+
     query = f"""
         SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
                1.0 AS score
-        FROM "{PG_SCHEMA}"."{TABLE_NAME}"
+        FROM "{PG_SCHEMA}"."{act_prof.table_name}"
         WHERE puid = ANY($1)
     """
     if is_skeleton is not None:
