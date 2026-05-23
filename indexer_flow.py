@@ -44,6 +44,7 @@ from cocoindex.ops.text import detect_code_language, RecursiveSplitter
 from cocoindex.ops.sentence_transformers import SentenceTransformerEmbedder
 from cocoindex.resources.file import FileLike, PatternFilePathMatcher
 from cocoindex.resources.id import IdGenerator
+from sentence_transformers import SentenceTransformer
 
 from ast_chunker import extract_ast_nodes
 
@@ -53,6 +54,46 @@ from ast_chunker import extract_ast_nodes
 DATABASE_URL: str = os.environ["COCOINDEX_DATABASE_URL"]
 PG_SCHEMA     = "public"
 WORKSPACE_DIR = "/tmp/workspace"
+
+# GLOBAL SINGLETON
+_QUERY_MODEL = None
+_CURRENT_MODEL_ID = None
+
+def get_query_model():
+    global _QUERY_MODEL
+    global _CURRENT_MODEL_ID
+
+    from embedder_config import load_active_profile
+    prof = load_active_profile()
+    
+    if _QUERY_MODEL is None or _CURRENT_MODEL_ID != prof.model_id:
+        
+
+        sys.stderr.write(
+            f"[SEARCH] Loading model: {prof.model_id}\n"
+        )
+        sys.stderr.flush()
+
+        _QUERY_MODEL = SentenceTransformer(
+            prof.model_id,
+            trust_remote_code=prof.trust_remote_code,
+        )
+
+        # nomic optimization
+        _QUERY_MODEL.tokenizer.model_max_length = 256
+
+        # warmup
+        _QUERY_MODEL.encode(
+            ["search_query: warmup"],
+            normalize_embeddings=True,
+        )
+        
+        _CURRENT_MODEL_ID = prof.model_id
+
+        sys.stderr.write("[SEARCH] Warmup complete\n")
+        sys.stderr.flush()
+
+    return _QUERY_MODEL
 
 from embedder_config import load_active_profile
 _active_profile = load_active_profile()
@@ -329,7 +370,7 @@ async def _search_async(
     from embedder_config import load_active_profile
     act_prof = load_active_profile()
 
-    embedder = SentenceTransformerEmbedder(act_prof.model_id)
+    ## embedder = SentenceTransformerEmbedder(act_prof.model_id)
     # Load profile để lấy query_prefix (có thể rỗng)
     from embedder_config import load_active_profile
     _prof = load_active_profile()
@@ -341,8 +382,14 @@ async def _search_async(
     embed_start = time.perf_counter()
     # === [DEBUG_LOG_END] ===
     
-    query_vec = await embedder.embed(enriched_query)
-    
+    model = get_query_model()
+    sys.stderr.write(f"[DEBUG] app_main: embedder model={model}\n")
+    query_vec = model.encode(
+        [enriched_query],
+        normalize_embeddings=True,
+    )[0]
+
+    sys.stderr.write(f"[DEBUG] app_main: query_vec={query_vec}\n")
     # === [DEBUG_LOG_START] ===
     embed_duration = time.perf_counter() - embed_start
     # === [DEBUG_LOG_END] ===
@@ -369,15 +416,6 @@ async def _search_async(
 
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         async with pool.acquire() as conn:
-            # === [DEBUG: Kiểm tra tổng số bản ghi và mẫu đường dẫn] ===
-            total_rows = await conn.fetchval(f'SELECT count(*) FROM "{PG_SCHEMA}"."{act_prof.table_name}"')
-            samples = await conn.fetch(f'SELECT filename FROM "{PG_SCHEMA}"."{act_prof.table_name}" LIMIT 3')
-            sys.stderr.write(f"[DEBUG] DB Total Rows: {total_rows}\n")
-            sys.stderr.write(f"[DEBUG] DB Filename Samples:\n")
-            for s in samples:
-                sys.stderr.write(f"  - {s['filename']}\n")
-            sys.stderr.flush()
-            
             query = f"""
                 SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
                        1.0 - (embedding <=> $1) AS score
@@ -500,14 +538,4 @@ def search(
     source_filters: Optional[List[str]] = None,
 ) -> list[dict]:
     """Sync wrapper — quản lý loop an toàn cho Streamlit."""
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    if loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-    return loop.run_until_complete(_search_async(query_text, top_k, source_filters))
+    return asyncio.run(_search_async(query_text, top_k, source_filters))
