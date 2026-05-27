@@ -15,7 +15,7 @@ from langchain_core.prompts import PromptTemplate
 
 import streamlit as st
 
-from indexer_flow import search as _search, fetch_nodes
+from indexer_flow import search as _search, fetch_nodes, fulltext_search as _fulltext_search, rrf_merge
 
 
 SCORE_THRESHOLD = 0.3
@@ -54,13 +54,15 @@ def query_cocoindex_db(
     llm = None,
     similarity_threshold: float = 0.3,
     use_query_expansion: bool = True,
+    use_hybrid: bool = True,
 ) -> list[Document]:
     """
     Semantic search nâng cao:
     1. Query Expansion (nếu có LLM và được bật)
-    2. Over-fetch (top_k * 2)
-    3. Score Threshold filtering (dynamic)
-    4. Loại bỏ trùng lặp
+    2. Over-fetch (top_k * 2) cho Vector và Full-Text
+    3. Hybrid Merge qua Reciprocal Rank Fusion (nếu bật)
+    4. Score Threshold filtering (dynamic)
+    5. Loại bỏ trùng lặp
     """
     try:
         # 1. Query Expansion
@@ -75,11 +77,21 @@ def query_cocoindex_db(
         
         sys.stderr.write(f"\n[RETRIEVAL_START] Processing {len(queries)} queries...\n")
         for idx, q in enumerate(queries):
-            results = _search(q, top_k=search_limit, source_filters=source_filters)
+            # Lấy vector
+            vector_results = _search(q, top_k=search_limit, source_filters=source_filters)
+            
+            # Nếu bật hybrid, lấy cả full-text và merge
+            if use_hybrid:
+                bm25_results = _fulltext_search(q, top_k=search_limit, source_filters=source_filters)
+                results = rrf_merge(vector_results, bm25_results, k=60)
+            else:
+                results = vector_results
+                
             count_valid = 0
             for r in results:
-                # 3. Score Threshold (Cosine Similarity)
-                if r["score"] < similarity_threshold:
+                # 3. Score Threshold (Cosine Similarity hoặc RRF score tuỳ loại search, tạm bỏ qua threshold cho RRF nếu cần)
+                score = r.get("_rrf_score", r["score"])
+                if not use_hybrid and score < similarity_threshold:
                     rejected_count += 1
                     continue
                 
@@ -95,7 +107,8 @@ def query_cocoindex_db(
         st.session_state.rejected_count = rejected_count
         
         # Sắp xếp lại theo score giảm dần sau khi gộp
-        all_results.sort(key=lambda x: x["score"], reverse=True)
+        # Nếu dùng hybrid thì score chính là _rrf_score, nếu không là score gốc
+        all_results.sort(key=lambda x: x.get("_rrf_score", x["score"]), reverse=True)
         
         # Lấy lại đúng số lượng top_k yêu cầu
         final_results = all_results[:top_k]
@@ -122,7 +135,7 @@ def query_cocoindex_db(
                 metadata={
                     "filename":   r["filename"],
                     "lang":       r["lang"],
-                    "score":      r["score"],
+                    "score":      r.get("_rrf_score", r["score"]),
                     "start_line": r["start_line"],
                     "end_line":   r["end_line"],
                     "is_test":    r["is_test"],

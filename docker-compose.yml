@@ -17,12 +17,12 @@ services:
     build: .
     ports:
       - "8501:8501"
-    deploy:
-      resources:
-        limits:
-          memory: 6g
-        reservations:
-          memory: 4g
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 6g
+    #     reservations:
+    #       memory: 4g
     volumes:
       - .:/app
       - /c:/host_c

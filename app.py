@@ -333,6 +333,11 @@ with st.sidebar:
         value=True,
         help="Sử dụng LLM để tạo các biến thể câu hỏi (tăng khả năng tìm thấy code)."
     )
+    hybrid_search = st.checkbox(
+        "🔀 Hybrid Search (Vector + BM25)",
+        value=True,
+        help="Kết hợp tìm kiếm nhúng vector và tìm kiếm full-text BM25. Kết quả sẽ được hợp nhất bằng RRF."
+    )
 
     # --- Source Filter ---
     st.write("---")
@@ -390,7 +395,8 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                     source_filters=search_sources_selection,
                     llm=llm,
                     similarity_threshold=similarity_threshold,
-                    use_query_expansion=use_query_expansion
+                    use_query_expansion=use_query_expansion,
+                    use_hybrid=hybrid_search
                 )
 
                 if "rejected_count" in st.session_state and st.session_state.rejected_count > 0:

@@ -323,6 +323,20 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
             )
         else:
             raise e
+            
+    # MIGRATION: Thêm cột text_search và GIN index cho full-text search
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        try:
+            # Xoá cột cũ (nếu có) để đảm bảo nó được tạo lại dưới dạng GENERATED ALWAYS có dữ liệu
+            await pool.execute(f'ALTER TABLE "{PG_SCHEMA}"."{act_prof.table_name}" DROP COLUMN IF EXISTS text_search')
+            await pool.execute(f'ALTER TABLE "{PG_SCHEMA}"."{act_prof.table_name}" ADD COLUMN text_search tsvector GENERATED ALWAYS AS (to_tsvector(\'english\'::regconfig, COALESCE(node_name, \'\') || \' \' || COALESCE(text, \'\'))) STORED')
+        except Exception as e:
+            sys.stderr.write(f"[MIGRATION ERROR] Failed to create text_search column: {e}\n")
+            
+        try:
+            await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_text_search ON "{PG_SCHEMA}"."{act_prof.table_name}" USING GIN (text_search)')
+        except Exception as e:
+            sys.stderr.write(f"[MIGRATION ERROR] Failed to create index: {e}\n")
 
     # Walk toàn bộ thư mục workspace — recursive=True đảm bảo lấy hết thư mục con
     files = localfs.walk_dir(
@@ -354,6 +368,37 @@ app = coco.App(
 
 
 # ─── Search ───────────────────────────────────────────────────────────────────
+
+def rrf_merge(vector_results, bm25_results, k: int = 60):
+    """Reciprocal Rank Fusion of two result lists.
+    Each result dict must contain a unique 'puid' key.
+    Returns a list sorted by combined RRF score.
+    """
+    scores: dict[str, float] = {}
+    merged: dict[str, dict] = {}
+    for rank, r in enumerate(vector_results):
+        puid = r.get('puid')
+        if puid:
+            scores[puid] = scores.get(puid, 0) + 1 / (k + rank + 1)
+            merged[puid] = r
+    for rank, r in enumerate(bm25_results):
+        puid = r.get('puid')
+        if puid:
+            scores[puid] = scores.get(puid, 0) + 1 / (k + rank + 1)
+            merged[puid] = r
+    for puid, r in merged.items():
+        r['_rrf_score'] = scores[puid]
+        
+    sorted_merged = sorted(merged.values(), key=lambda x: x['_rrf_score'], reverse=True)
+    
+    sys.stderr.write(f"\n[RRF_MERGE] Merged {len(vector_results)} Vector + {len(bm25_results)} BM25 results -> {len(sorted_merged)} unique.\n")
+    for i, r in enumerate(sorted_merged[:15]): # Chỉ log top 15 để đỡ rối
+        sys.stderr.write(f"  {i+1}. [RRF] {r['puid']} (rrf_score: {r['_rrf_score']:.4f})\n")
+    sys.stderr.write("=============================================\n")
+    sys.stderr.flush()
+
+    # Sort by the RRF score descending
+    return sorted_merged
 
 async def _search_async(
     query_text: str,
@@ -411,8 +456,6 @@ async def _search_async(
         filter_sql = "AND (" + " OR ".join(conditions) + ")"
         # Cập nhật params cho SQL query
         final_source_filters = mapped_filters
-    else:
-        final_source_filters = []
 
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         async with pool.acquire() as conn:
@@ -539,3 +582,100 @@ def search(
 ) -> list[dict]:
     """Sync wrapper — quản lý loop an toàn cho Streamlit."""
     return asyncio.run(_search_async(query_text, top_k, source_filters))
+
+
+async def _fulltext_search_async(
+    query_text: str,
+    top_k: int = TOP_K,
+    source_filters: Optional[List[str]] = None,
+) -> list[dict]:
+    """Full‑text BM25‑like search using PostgreSQL tsvector."""
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+
+    filter_sql = ""
+    params: list = []
+    
+    # We will format plainto_tsquery('english', $X) where X is the parameter index
+    
+    if source_filters:
+        mapped_filters = [f"{WORKSPACE_DIR}/{get_workspace_subdir(f)}" for f in source_filters]
+        conditions = []
+        for i, src in enumerate(mapped_filters):
+            param_idx = len(params) + 1
+            conditions.append(f"filename LIKE ${param_idx} || '%'")
+            params.append(src)
+        filter_sql = "AND (" + " OR ".join(conditions) + ")"
+
+    # The query text is the last parameter
+    param_idx_query = len(params) + 1
+    params.append(query_text)
+    
+    param_idx_topk = len(params) + 1
+    params.append(top_k)
+
+    sql = f"""
+        WITH query_ts AS (
+            SELECT replace(plainto_tsquery('english', ${param_idx_query})::text, '&', '|')::tsquery AS q
+        )
+        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
+               ts_rank_cd(text_search, query_ts.q) AS score
+        FROM "{PG_SCHEMA}"."{act_prof.table_name}", query_ts
+        WHERE text_search @@ query_ts.q
+        {filter_sql}
+        ORDER BY score DESC
+        LIMIT ${param_idx_topk}
+    """
+    
+    bm25_start = time.perf_counter()
+
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, *params)
+            
+    bm25_duration = time.perf_counter() - bm25_start
+    
+    sys.stderr.write(f"\n[BM25_SEARCH] Query: '{query_text}'\n")
+    sys.stderr.write(f"[BM25_SEARCH] Time: {bm25_duration:.4f}s\n")
+    sys.stderr.write(f"[BM25_SEARCH] Found {len(rows)} nodes:\n")
+    for i, r in enumerate(rows):
+        sys.stderr.write(f"  {i+1}. [BM25] {r['puid']} (rank_score: {r['score']:.4f})\n")
+    sys.stderr.write("=============================================\n")
+    sys.stderr.flush()
+
+    results = []
+    for r in rows:
+        results.append({
+            "filename": r["filename"],
+            "lang": r["lang"],
+            "text": r["text"],
+            "score": float(r["score"]),
+            "start_line": r["start_line"],
+            "end_line": r["end_line"],
+            "is_test": r["is_test"],
+            "node_type": r.get("node_type", ""),
+            "node_name": r.get("node_name", ""),
+            "puid": r["puid"],
+            "parent_puid": r.get("parent_puid", ""),
+            "is_skeleton": r.get("is_skeleton", False),
+        })
+    return results
+
+
+def fulltext_search(
+    query_text: str,
+    top_k: int = TOP_K,
+    source_filters: Optional[List[str]] = None,
+) -> list[dict]:
+    """Sync wrapper cho fulltext search."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    return loop.run_until_complete(_fulltext_search_async(query_text, top_k, source_filters))
