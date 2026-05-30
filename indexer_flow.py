@@ -434,7 +434,6 @@ async def _search_async(
         normalize_embeddings=True,
     )[0]
 
-    sys.stderr.write(f"[DEBUG] app_main: query_vec={query_vec}\n")
     # === [DEBUG_LOG_START] ===
     embed_duration = time.perf_counter() - embed_start
     # === [DEBUG_LOG_END] ===
@@ -678,4 +677,4 @@ def fulltext_search(
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-    return loop.run_until_complete(_fulltext_search_async(query_text, top_k, source_filters))
+    return loop.run_until_complete(_fulltext_search_async(query_text, top_k, source_filters))

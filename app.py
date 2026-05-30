@@ -338,6 +338,12 @@ with st.sidebar:
         value=True,
         help="Kết hợp tìm kiếm nhúng vector và tìm kiếm full-text BM25. Kết quả sẽ được hợp nhất bằng RRF."
     )
+    use_reranker = st.checkbox(
+        "🔥 Bật Cross-Encoder Reranker",
+        value=False,
+        help="Sắp xếp lại các đoạn code bằng mô hình Cross-Encoder để tăng độ chính xác của kết quả, tốn thêm 1.5 - 3s phản hồi."
+    )
+
 
     # --- Source Filter ---
     st.write("---")
@@ -396,7 +402,8 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                     llm=llm,
                     similarity_threshold=similarity_threshold,
                     use_query_expansion=use_query_expansion,
-                    use_hybrid=hybrid_search
+                    use_hybrid=hybrid_search,
+                    use_reranker=use_reranker
                 )
 
                 if "rejected_count" in st.session_state and st.session_state.rejected_count > 0:
@@ -438,21 +445,41 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                                 if is_test: tag += " 🧪 TEST"
                                 if is_skeleton: tag += " 📖 SKELETON"
 
-                                # Định dạng màu sắc/icon theo score
-                                if score >= 0.7:
-                                    score_icon = "🟢"
-                                    score_desc = "High relevance"
-                                elif score >= 0.5:
-                                    score_icon = "🟡"
-                                    score_desc = "Medium relevance"
+                                score_type = meta.get("score_type", "cosine_or_rrf")
+
+                                # Định dạng màu sắc/icon theo score và score_type
+                                if score_type == "rerank":
+                                    # Logit thô của Cross-Encoder (ms-marco-MiniLM-L-6-v2) thường nằm trong khoảng [-10, 10]
+                                    if score > 0.0:
+                                        score_icon = "🟢"
+                                        score_desc = "High relevance (Reranked)"
+                                    elif score > -2.0:
+                                        score_icon = "🟡"
+                                        score_desc = "Medium relevance (Reranked)"
+                                    else:
+                                        score_icon = "🔴"
+                                        score_desc = "Low relevance (Reranked)"
+                                    score_str = f"{score:+.3f}"
+                                elif score_type == "skeleton":
+                                    score_icon = "📖"
+                                    score_desc = "Context Enrichment"
+                                    score_str = "N/A"
                                 else:
-                                    score_icon = "🔴"
-                                    score_desc = "Low relevance"
+                                    if score >= 0.7:
+                                        score_icon = "🟢"
+                                        score_desc = "High relevance"
+                                    elif score >= 0.5:
+                                        score_icon = "🟡"
+                                        score_desc = "Medium relevance"
+                                    else:
+                                        score_icon = "🔴"
+                                        score_desc = "Low relevance"
+                                    score_str = f"{score:.3f}"
 
                                 node_info = f" **[{node_type.upper()}: {node_name}]**" if node_type and node_name else ""
                                 st.write(
                                     f"**[{idx+1}]** `{display_filename}`{node_info}  "
-                                    f"L{start}–L{end}{tag}  ·  {score_icon} **{score_desc}** *({score:.3f})*"
+                                    f"L{start}–L{end}{tag}  ·  {score_icon} **{score_desc}** *({score_str})*"
                                 )
                                 if puid:
                                     st.caption(f"PUID: `{puid}`")

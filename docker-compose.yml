@@ -25,6 +25,7 @@ services:
     #       memory: 4g
     volumes:
       - .:/app
+      - /d:/host_d
       - /c:/host_c
       - huggingface_cache:/root/.cache/huggingface
     environment:

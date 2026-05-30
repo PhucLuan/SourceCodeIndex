@@ -20,6 +20,51 @@ from indexer_flow import search as _search, fetch_nodes, fulltext_search as _ful
 
 SCORE_THRESHOLD = 0.3
 
+_RERANKER_MODEL = None
+
+def get_reranker_model():
+    """Tải CrossEncoder model theo mô hình Singleton."""
+    global _RERANKER_MODEL
+    if _RERANKER_MODEL is None:
+        import sys
+        from sentence_transformers import CrossEncoder
+        sys.stderr.write("\n[RERANKER] Loading CrossEncoder model: cross-encoder/ms-marco-MiniLM-L-6-v2...\n")
+        sys.stderr.flush()
+        _RERANKER_MODEL = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        sys.stderr.write("[RERANKER] Model loaded successfully.\n")
+        sys.stderr.flush()
+    return _RERANKER_MODEL
+
+def rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]:
+    """Chấm điểm chéo các ứng cử viên bằng Cross-Encoder."""
+    if not candidates:
+        return []
+    
+    model = get_reranker_model()
+    # Tạo các cặp (query, document_text)
+    pairs = [(query, c["text"]) for c in candidates]
+    
+    start_time = time.perf_counter()
+    scores = model.predict(pairs)
+    duration = time.perf_counter() - start_time
+    
+    # Gán score mới và đánh dấu score_type
+    for c, score in zip(candidates, scores):
+        c["_rerank_score"] = float(score)
+        c["score_type"] = "rerank"
+        
+    # Sắp xếp lại theo điểm reranker giảm dần
+    reranked = sorted(candidates, key=lambda x: x["_rerank_score"], reverse=True)
+    
+    sys.stderr.write(f"\n[RERANKER] Reranked {len(candidates)} candidates in {duration:.4f}s\n")
+    for i, r in enumerate(reranked[:10]):
+        sys.stderr.write(f"  {i+1}. [RERANKED] {r['puid']} (rerank_score: {r['_rerank_score']:.4f}, old_score: {r.get('_rrf_score', r['score']):.4f})\n")
+    sys.stderr.write("=============================================\n")
+    sys.stderr.flush()
+    
+    return reranked[:top_k]
+
+
 def expand_query(query_text: str, llm) -> list[str]:
     """Sử dụng LLM để tạo ra các biến thể kỹ thuật của câu hỏi giúp tăng recall."""
     if not llm:
@@ -55,6 +100,7 @@ def query_cocoindex_db(
     similarity_threshold: float = 0.3,
     use_query_expansion: bool = True,
     use_hybrid: bool = True,
+    use_reranker: bool = False,
 ) -> list[Document]:
     """
     Semantic search nâng cao:
@@ -63,6 +109,7 @@ def query_cocoindex_db(
     3. Hybrid Merge qua Reciprocal Rank Fusion (nếu bật)
     4. Score Threshold filtering (dynamic)
     5. Loại bỏ trùng lặp
+    6. Cross-Encoder Reranker (nếu bật)
     """
     try:
         # 1. Query Expansion
@@ -111,7 +158,14 @@ def query_cocoindex_db(
         all_results.sort(key=lambda x: x.get("_rrf_score", x["score"]), reverse=True)
         
         # Lấy lại đúng số lượng top_k yêu cầu
-        final_results = all_results[:top_k]
+        if use_reranker:
+            # Rerank toàn bộ danh sách unique candidates và lấy top_k
+            final_results = rerank(query_text, all_results, top_k)
+        else:
+            # Gán score_type là cosine_or_rrf cho tất cả
+            for r in all_results:
+                r["score_type"] = "rrf" if use_hybrid else "cosine"
+            final_results = all_results[:top_k]
         
         # --- Giai đoạn 5: Context Enrichment (Skeleton Retrieval) ---
         # Nếu kết quả là method/function, ta lấy thêm Skeleton của Class cha hoặc File
@@ -126,6 +180,7 @@ def query_cocoindex_db(
             for skel in skeletons:
                 # Gán score cố định để đánh dấu đây là context bổ trợ
                 skel["score"] = 0.99 
+                skel["score_type"] = "skeleton"
                 enriched_results.append(skel)
                 seen_puids.add(skel["puid"])
         
@@ -135,7 +190,8 @@ def query_cocoindex_db(
                 metadata={
                     "filename":   r["filename"],
                     "lang":       r["lang"],
-                    "score":      r.get("_rrf_score", r["score"]),
+                    "score":      r.get("_rerank_score", r.get("_rrf_score", r["score"])),
+                    "score_type": r.get("score_type", "cosine_or_rrf"),
                     "start_line": r["start_line"],
                     "end_line":   r["end_line"],
                     "is_test":    r["is_test"],
