@@ -15,7 +15,15 @@ from langchain_core.prompts import PromptTemplate
 
 import streamlit as st
 
-from indexer_flow import search as _search, fetch_nodes, fulltext_search as _fulltext_search, rrf_merge
+from indexer_flow import (
+    search as _search,
+    fetch_nodes,
+    fulltext_search as _fulltext_search,
+    rrf_merge,
+    get_all_repo_names,
+    search_per_repo,
+    fulltext_search_per_repo,
+)
 
 
 SCORE_THRESHOLD = 0.3
@@ -92,6 +100,47 @@ Câu hỏi: {query_text}"""
         sys.stderr.write(f"[WARNING] Query expansion failed: {e}\n")
         return [query_text]
 
+# ── Soft‑quota helper ─────────────────────────────────────────────────────────
+
+def _enforce_soft_quota(
+    merged: list[dict],
+    top_k: int,
+    max_per_repo: int,
+) -> list[dict]:
+    """
+    Apply a soft quota so that no single repo can monopolise the top‑k slots.
+
+    Strategy:
+      - Walk the RRF‑sorted list.
+      - Keep a per‑repo counter.
+      - Once a repo fills its *hard* slot (max_per_repo) we put it in a
+        "overflow" bucket.  After the main pass, append overflow items until
+        top_k is satisfied.
+    This guarantees at least some diversity while still respecting global rank.
+    """
+    repo_counts: dict[str, int] = {}
+    primary: list[dict] = []
+    overflow: list[dict] = []
+
+    for item in merged:
+        repo = item.get("repo_name", "__unknown__")
+        cnt  = repo_counts.get(repo, 0)
+        if cnt < max_per_repo:
+            primary.append(item)
+            repo_counts[repo] = cnt + 1
+        else:
+            overflow.append(item)
+
+        if len(primary) >= top_k:
+            break
+
+    # Fill remaining slots from overflow (already in global RRF order)
+    need = top_k - len(primary)
+    return primary + overflow[:need]
+
+
+# ── Main retrieval function (Task 3.5.1 – per‑repo + soft quota) ──────────────
+
 def query_cocoindex_db(
     query_text: str,
     top_k: int = 8,
@@ -103,101 +152,195 @@ def query_cocoindex_db(
     use_reranker: bool = False,
 ) -> list[Document]:
     """
-    Semantic search nâng cao:
-    1. Query Expansion (nếu có LLM và được bật)
-    2. Over-fetch (top_k * 2) cho Vector và Full-Text
-    3. Hybrid Merge qua Reciprocal Rank Fusion (nếu bật)
-    4. Score Threshold filtering (dynamic)
-    5. Loại bỏ trùng lặp
-    6. Cross-Encoder Reranker (nếu bật)
+    Multi‑repo aware semantic search (Task 3.5.1).
+
+    Pipeline:
+      1. Query Expansion  – LLM generates 2‑3 query variants (optional).
+      2. Repo Discovery   – list all repo_name values currently indexed.
+      3. Per‑repo fetch   – for each (query, repo) pair run vector search
+                           and optionally BM25; merge via RRF *within* repo.
+      4. Global RRF       – merge per‑repo winners into a single ranked list.
+      5. Soft Quota       – cap slots per repo to avoid single‑repo dominance.
+      6. Score Threshold  – reject low‑confidence cosine hits (non‑hybrid).
+      7. De‑duplication   – drop items already seen by PUID.
+      8. Cross‑Encoder    – optional reranker pass.
+      9. Context Enrich   – pull parent skeleton nodes for richer context.
     """
     try:
-        # 1. Query Expansion
+        # ── 1. Query Expansion ────────────────────────────────────────────────
         queries = expand_query(query_text, llm) if (llm and use_query_expansion) else [query_text]
-        
-        all_results = []
-        seen_puids = set()
-        
-        # 2. Over-fetch cho mỗi query (lấy dư để filter)
-        search_limit = top_k * 2
-        rejected_count = 0
-        
-        sys.stderr.write(f"\n[RETRIEVAL_START] Processing {len(queries)} queries...\n")
-        for idx, q in enumerate(queries):
-            # Lấy vector
-            vector_results = _search(q, top_k=search_limit, source_filters=source_filters)
-            
-            # Nếu bật hybrid, lấy cả full-text và merge
-            if use_hybrid:
-                bm25_results = _fulltext_search(q, top_k=search_limit, source_filters=source_filters)
-                results = rrf_merge(vector_results, bm25_results, k=60)
+
+        # ── 2. Repo Discovery ────────────────────────────────────────────────
+        # If the caller supplied source_filters we search only those repos;
+        # otherwise we discover all repos dynamically from the DB.
+        if source_filters:
+            repo_names = list(source_filters)
+        else:
+            try:
+                repo_names = get_all_repo_names()
+            except Exception as ex:
+                sys.stderr.write(f"[WARN] get_all_repo_names failed: {ex}; falling back to global search.\n")
+                repo_names = []
+
+        # Decide whether to use per‑repo path or fall back to global search
+        use_per_repo = len(repo_names) > 1
+
+        search_limit = top_k * 2   # over‑fetch per repo / globally
+        all_results: list[dict] = []
+        seen_puids: set[str]    = set()
+        rejected_count          = 0
+
+        sys.stderr.write(
+            f"\n[RETRIEVAL_START] {len(queries)} queries × "
+            f"{len(repo_names) if use_per_repo else '1 (global)'} repo(s)\n"
+        )
+
+        if use_per_repo:
+            # ── 3. Per‑repo fetch & intra‑repo RRF ───────────────────────────
+            # Collect per‑repo merged lists for all queries.
+            # key: repo_name  value: list of RRF‑merged hits
+            per_repo_hits: dict[str, list[dict]] = {r: [] for r in repo_names}
+            seen_per_repo: dict[str, set[str]]   = {r: set() for r in repo_names}
+
+            for idx, q in enumerate(queries):
+                for repo in repo_names:
+                    vec_hits  = search_per_repo(q, top_k=search_limit, repo_name=repo)
+
+                    if use_hybrid:
+                        bm25_hits = fulltext_search_per_repo(q, top_k=search_limit, repo_name=repo)
+                        merged    = rrf_merge(vec_hits, bm25_hits, k=60)
+                    else:
+                        merged = vec_hits
+
+                    for item in merged:
+                        puid = item.get("puid", "")
+                        if puid and puid not in seen_per_repo[repo]:
+                            per_repo_hits[repo].append(item)
+                            seen_per_repo[repo].add(puid)
+
+                sys.stderr.write(
+                    f"  - Query {idx}: '{q[:50]}' done across {len(repo_names)} repos.\n"
+                )
+
+            # Sort each repo's list by its best score, keep top search_limit
+            for repo in repo_names:
+                per_repo_hits[repo].sort(
+                    key=lambda x: x.get("_rrf_score", x["score"]), reverse=True
+                )
+                per_repo_hits[repo] = per_repo_hits[repo][:search_limit]
+
+            # ── 4. Global RRF across repos ────────────────────────────────────
+            # Build two synthetic ranked lists: all vector and all bm25 hits
+            # already merged per‑repo – we RRF the per‑repo top lists together.
+            # For simplicity we treat per‑repo merged lists as a single pool
+            # and run one more RRF pass (lists ordered by per‑repo RRF score).
+            all_repo_lists = list(per_repo_hits.values())
+
+            if len(all_repo_lists) == 1:
+                global_merged = all_repo_lists[0]
+            elif len(all_repo_lists) == 0:
+                global_merged = []
             else:
-                results = vector_results
-                
-            count_valid = 0
-            for r in results:
-                # 3. Score Threshold (Cosine Similarity hoặc RRF score tuỳ loại search, tạm bỏ qua threshold cho RRF nếu cần)
-                score = r.get("_rrf_score", r["score"])
+                # iteratively RRF‑merge multiple per‑repo lists
+                global_merged = all_repo_lists[0]
+                for other in all_repo_lists[1:]:
+                    global_merged = rrf_merge(global_merged, other, k=60)
+
+            global_merged.sort(
+                key=lambda x: x.get("_rrf_score", x["score"]), reverse=True
+            )
+
+            # ── 5. Soft Quota ─────────────────────────────────────────────────
+            # Allow at most ceil(top_k / n_repos) + 1 slots per repo so that
+            # every repo gets a fair chance but top results still float up.
+            import math
+            n_repos    = max(len(repo_names), 1)
+            max_per_repo = math.ceil(top_k / n_repos) + 1
+
+            candidates = _enforce_soft_quota(global_merged, top_k * 2, max_per_repo)
+
+            # ── 6. Score threshold & de‑dup ───────────────────────────────────
+            for item in candidates:
+                score = item.get("_rrf_score", item["score"])
                 if not use_hybrid and score < similarity_threshold:
                     rejected_count += 1
                     continue
-                
-                # 4. De-duplicate by PUID
-                puid = r.get("puid", "")
+                puid = item.get("puid", "")
                 if puid not in seen_puids:
-                    all_results.append(r)
+                    all_results.append(item)
                     seen_puids.add(puid)
-                    count_valid += 1
-            sys.stderr.write(f"  - Query {idx}: '{q[:50]}...' -> Found {len(results)} total, {count_valid} new above threshold.\n")
-        
-        # Lưu số lượng bị loại vào session state để hiển thị trên UI
-        st.session_state.rejected_count = rejected_count
-        
-        # Sắp xếp lại theo score giảm dần sau khi gộp
-        # Nếu dùng hybrid thì score chính là _rrf_score, nếu không là score gốc
+
+        else:
+            # ── Fallback: single‑repo or no repos – use original global search ─
+            for idx, q in enumerate(queries):
+                vec_hits = _search(q, top_k=search_limit, source_filters=source_filters)
+
+                if use_hybrid:
+                    bm25_hits = _fulltext_search(q, top_k=search_limit, source_filters=source_filters)
+                    results   = rrf_merge(vec_hits, bm25_hits, k=60)
+                else:
+                    results = vec_hits
+
+                count_valid = 0
+                for item in results:
+                    score = item.get("_rrf_score", item["score"])
+                    if not use_hybrid and score < similarity_threshold:
+                        rejected_count += 1
+                        continue
+                    puid = item.get("puid", "")
+                    if puid not in seen_puids:
+                        all_results.append(item)
+                        seen_puids.add(puid)
+                        count_valid += 1
+
+                sys.stderr.write(
+                    f"  - Query {idx}: '{q[:50]}' -> {count_valid} new results.\n"
+                )
+
+        # Persist rejected count for UI display
+        try:
+            st.session_state.rejected_count = rejected_count
+        except Exception:
+            pass
+
+        # ── Final sort ────────────────────────────────────────────────────────
         all_results.sort(key=lambda x: x.get("_rrf_score", x["score"]), reverse=True)
-        
-        # Lấy lại đúng số lượng top_k yêu cầu
+
+        # ── 7. Reranker or plain top‑k ────────────────────────────────────────
         if use_reranker:
-            # Rerank toàn bộ danh sách unique candidates và lấy top_k
             final_results = rerank(query_text, all_results, top_k)
         else:
-            # Gán score_type là cosine_or_rrf cho tất cả
-            for r in all_results:
-                r["score_type"] = "rrf" if use_hybrid else "cosine"
+            for item in all_results:
+                item["score_type"] = "rrf" if use_hybrid else "cosine"
             final_results = all_results[:top_k]
-        
-        # --- Giai đoạn 5: Context Enrichment (Skeleton Retrieval) ---
-        # Nếu kết quả là method/function, ta lấy thêm Skeleton của Class cha hoặc File
+
+        # ── 8. Context Enrichment (skeleton retrieval) ────────────────────────
         enriched_results = list(final_results)
-        parent_puids = {r["parent_puid"] for r in final_results if r.get("parent_puid")}
-        
-        # Lọc các PUID chưa có trong kết quả hiện tại
-        puids_to_fetch = [p for p in parent_puids if p not in seen_puids]
-        
+        parent_puids     = {r["parent_puid"] for r in final_results if r.get("parent_puid")}
+        puids_to_fetch   = [p for p in parent_puids if p not in seen_puids]
+
         if puids_to_fetch:
             skeletons = fetch_nodes(puids_to_fetch, is_skeleton=True)
             for skel in skeletons:
-                # Gán score cố định để đánh dấu đây là context bổ trợ
-                skel["score"] = 0.99 
+                skel["score"]      = 0.99
                 skel["score_type"] = "skeleton"
                 enriched_results.append(skel)
                 seen_puids.add(skel["puid"])
-        
+
         return [
             Document(
                 page_content=r["text"],
                 metadata={
-                    "filename":   r["filename"],
-                    "lang":       r["lang"],
-                    "score":      r.get("_rerank_score", r.get("_rrf_score", r["score"])),
-                    "score_type": r.get("score_type", "cosine_or_rrf"),
-                    "start_line": r["start_line"],
-                    "end_line":   r["end_line"],
-                    "is_test":    r["is_test"],
-                    "node_type":  r.get("node_type", ""),
-                    "node_name":  r.get("node_name", ""),
-                    "puid":       r.get("puid", ""),
+                    "filename":    r["filename"],
+                    "lang":        r["lang"],
+                    "score":       r.get("_rerank_score", r.get("_rrf_score", r["score"])),
+                    "score_type":  r.get("score_type", "cosine_or_rrf"),
+                    "start_line":  r["start_line"],
+                    "end_line":    r["end_line"],
+                    "is_test":     r["is_test"],
+                    "node_type":   r.get("node_type", ""),
+                    "node_name":   r.get("node_name", ""),
+                    "puid":        r.get("puid", ""),
                     "parent_puid": r.get("parent_puid", ""),
                     "is_skeleton": r.get("is_skeleton", False),
                     "repo_name":   r.get("repo_name", ""),
@@ -205,6 +348,7 @@ def query_cocoindex_db(
             )
             for r in enriched_results
         ]
+
     except Exception as e:
         if "does not exist" in str(e).lower():
             return []

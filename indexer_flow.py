@@ -497,7 +497,11 @@ async def _search_async(
                 final_source_filters.append(dst_name)
         filter_sql = "AND repo_name = ANY($3)"
 
-    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+    from pgvector.asyncpg import register_vector
+    async def _init(conn):
+        await register_vector(conn)
+
+    async with await asyncpg.create_pool(DATABASE_URL, init=_init) as pool:
         async with pool.acquire() as conn:
             query = f"""
                 SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton, repo_name,
@@ -507,7 +511,7 @@ async def _search_async(
                 ORDER BY score DESC
                 LIMIT $2
             """
-            params = [str(query_vec.tolist()), top_k]
+            params = [query_vec.tolist(), top_k]
             if final_source_filters:
                 params.append(final_source_filters)
             
@@ -724,3 +728,169 @@ def fulltext_search(
         asyncio.set_event_loop(loop)
         
     return loop.run_until_complete(_fulltext_search_async(query_text, top_k, source_filters))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 3.5.1 – Per‑repo helpers for multi‑repo diversity
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _get_all_repo_names_async() -> list[str]:
+    """Return distinct repo_name values present in the index table."""
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT DISTINCT repo_name"
+                f" FROM \"{PG_SCHEMA}\".\"{act_prof.table_name}\""
+                f" WHERE repo_name IS NOT NULL AND repo_name <> ''"
+            )
+    return [r["repo_name"] for r in rows]
+
+
+def get_all_repo_names() -> list[str]:
+    """Sync wrapper – returns distinct repo names from the index."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(_get_all_repo_names_async())
+
+
+# ── per‑repo vector search ────────────────────────────────────────────────────
+
+async def _search_per_repo_async(
+    query_text: str,
+    top_k: int = TOP_K,
+    repo_name: str = "",
+) -> list[dict]:
+    """Vector (cosine) search restricted to a single repository."""
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+    model = get_query_model()
+    # Encode query to vector (list of floats)
+    query_vec = model.encode([query_text], normalize_embeddings=True)[0]
+    # Register pgvector type on each connection in the pool
+    from pgvector.asyncpg import register_vector
+    async def _init(conn):
+        await register_vector(conn)
+
+    async with await asyncpg.create_pool(DATABASE_URL, init=_init) as pool:
+        async with pool.acquire() as conn:
+            sql = f"""
+                SELECT filename, lang, text, start_line, end_line,
+                       is_test, node_type, node_name, puid, parent_puid,
+                       is_skeleton, repo_name,
+                       1.0 - (embedding <=> $1) AS score
+                FROM "{PG_SCHEMA}"."{act_prof.table_name}"
+                WHERE repo_name = $2
+                ORDER BY score DESC
+                LIMIT $3
+            """
+            rows = await conn.fetch(sql, query_vec.tolist(), repo_name, top_k)
+
+    return [
+        {
+            "filename":    r["filename"],
+            "lang":        r["lang"],
+            "text":        r["text"],
+            "score":       float(r["score"]),
+            "start_line":  r["start_line"],
+            "end_line":    r["end_line"],
+            "is_test":     r["is_test"],
+            "node_type":   r.get("node_type", ""),
+            "node_name":   r.get("node_name", ""),
+            "puid":        r["puid"],
+            "parent_puid": r.get("parent_puid", ""),
+            "is_skeleton": r.get("is_skeleton", False),
+            "repo_name":   r.get("repo_name", ""),
+        }
+        for r in rows
+    ]
+
+
+def search_per_repo(
+    query_text: str,
+    top_k: int = TOP_K,
+    repo_name: str = "",
+) -> list[dict]:
+    """Sync wrapper for per‑repo vector search."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(_search_per_repo_async(query_text, top_k, repo_name))
+
+
+# ── per‑repo full‑text (BM25) search ─────────────────────────────────────────
+
+async def _fulltext_search_per_repo_async(
+    query_text: str,
+    top_k: int = TOP_K,
+    repo_name: str = "",
+) -> list[dict]:
+    """Full‑text (BM25/ts_rank) search restricted to a single repository."""
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+
+    sql = f"""
+        WITH query_ts AS (
+            SELECT replace(plainto_tsquery('english', $1)::text, '&', '|')::tsquery AS q
+        )
+        SELECT filename, lang, text, start_line, end_line,
+               is_test, node_type, node_name, puid, parent_puid,
+               is_skeleton, repo_name,
+               ts_rank_cd(text_search, query_ts.q) AS score
+        FROM "{PG_SCHEMA}"."{act_prof.table_name}", query_ts
+        WHERE text_search @@ query_ts.q
+          AND repo_name = $2
+        ORDER BY score DESC
+        LIMIT $3
+    """
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, query_text, repo_name, top_k)
+
+    return [
+        {
+            "filename":    r["filename"],
+            "lang":        r["lang"],
+            "text":        r["text"],
+            "score":       float(r["score"]),
+            "start_line":  r["start_line"],
+            "end_line":    r["end_line"],
+            "is_test":     r["is_test"],
+            "node_type":   r.get("node_type", ""),
+            "node_name":   r.get("node_name", ""),
+            "puid":        r["puid"],
+            "parent_puid": r.get("parent_puid", ""),
+            "is_skeleton": r.get("is_skeleton", False),
+            "repo_name":   r.get("repo_name", ""),
+        }
+        for r in rows
+    ]
+
+
+def fulltext_search_per_repo(
+    query_text: str,
+    top_k: int = TOP_K,
+    repo_name: str = "",
+) -> list[dict]:
+    """Sync wrapper for per‑repo full‑text search."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(_fulltext_search_per_repo_async(query_text, top_k, repo_name))
