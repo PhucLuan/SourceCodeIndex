@@ -65,6 +65,38 @@ def get_workspace_subdir(original_src: str) -> str:
     return f"{folder_name}_{path_hash}"
 
 
+def load_repo_chunk_counts() -> dict[str, int]:
+    """Truy vấn SQL gom nhóm theo repo_name để lấy thống kê số chunk đã index."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+    async def _fetch():
+        from embedder_config import load_active_profile
+        act_prof = load_active_profile()
+        db_url = os.environ.get(
+            "COCOINDEX_DATABASE_URL", 
+            "postgresql://cocoindex:cocoindex_password@localhost:5432/cocoindex_db"
+        )
+        try:
+            conn = await asyncpg.connect(db_url)
+            rows = await conn.fetch(
+                f'SELECT repo_name, COUNT(*) as cnt FROM "{PG_SCHEMA}"."{act_prof.table_name}" GROUP BY repo_name'
+            )
+            await conn.close()
+            return {r["repo_name"] or "Không rõ": r["cnt"] for r in rows}
+        except Exception:
+            return {}
+            
+    return loop.run_until_complete(_fetch())
+
+
 def sync_workspace(sources_to_sync: list[str], includes_list: list[str], excludes_list: list[str]) -> None:
     """
     Copy source files vào WORKSPACE_DIR.
@@ -347,16 +379,34 @@ with st.sidebar:
 
     # --- Source Filter ---
     st.write("---")
-    st.subheader("4. Lọc theo Project")
-    all_sources = load_sources()
-    # Sử dụng key duy nhất để tránh xung đột với các multiselect khác
-    search_sources_selection = st.multiselect(
-        "Chỉ tìm trong các nguồn này:",
-        options=all_sources,
-        default=None,
-        key="chat_search_sources",
-        help="Bắt buộc chọn ít nhất một nguồn để tìm kiếm."
+    st.subheader("4. Phạm vi Tìm kiếm (Scope)")
+    search_scope = st.radio(
+        "Chọn phạm vi tìm kiếm:",
+        ["Tìm trên tất cả Project (Cross-Repo)", "Chỉ tìm trong Project được chọn"],
+        index=0,
+        help="Chọn 'Tìm trên tất cả Project' để tự động tìm kiếm chéo giữa mọi repository đã index."
     )
+    
+    search_sources_selection = []
+    if search_scope == "Chỉ tìm trong Project được chọn":
+        all_sources = load_sources()
+        search_sources_selection = st.multiselect(
+            "Chỉ tìm trong các nguồn này:",
+            options=all_sources,
+            default=None,
+            key="chat_search_sources",
+            help="Chọn một hoặc nhiều project để giới hạn phạm vi tìm kiếm."
+        )
+
+    # --- Index Stats ---
+    st.write("---")
+    st.subheader("📊 Thống kê Index")
+    counts = load_repo_chunk_counts()
+    if counts:
+        for repo, cnt in counts.items():
+            st.write(f"- 📦 **{repo}**: {cnt:,} chunks")
+    else:
+        st.caption("Chưa có dữ liệu index hoặc DB trống.")
 
 
 # ─── MAIN UI ─────────────────────────────────────────────────────────────────
@@ -374,9 +424,9 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 if query := st.chat_input("Nhập câu hỏi về codebase..."):
-    # KIỂM TRA: Bắt buộc chọn nguồn từ biến search_sources_selection
-    if not search_sources_selection:
-        st.error("⚠️ Vui lòng chọn ít nhất một Project trong mục **'4. Lọc theo Project'** ở thanh bên trái trước khi tìm kiếm!")
+    # KIỂM TRA: Bắt buộc chọn nguồn nếu ở chế độ lọc project
+    if search_scope == "Chỉ tìm trong Project được chọn" and not search_sources_selection:
+        st.error("⚠️ Vui lòng chọn ít nhất một Project trong mục **'4. Phạm vi Tìm kiếm (Scope)'** ở thanh bên trái trước khi tìm kiếm!")
     else:
         st.session_state.messages.append({"role": "user", "content": query})
         with st.chat_message("user"):
@@ -398,7 +448,7 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                 docs = query_cocoindex_db(
                     query, 
                     top_k=top_k,
-                    source_filters=search_sources_selection,
+                    source_filters=search_sources_selection if search_scope == "Chỉ tìm trong Project được chọn" else None,
                     llm=llm,
                     similarity_threshold=similarity_threshold,
                     use_query_expansion=use_query_expansion,
@@ -431,6 +481,9 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                                         display_filename = parts[1]
                                     else:
                                         display_filename = parts[0]
+
+                                repo_name = meta.get("repo_name", "")
+                                repo_tag = f" 📦 [{repo_name}]" if repo_name else ""
 
                                 start = meta.get("start_line", "?")
                                 end = meta.get("end_line", "?")
@@ -478,7 +531,7 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
 
                                 node_info = f" **[{node_type.upper()}: {node_name}]**" if node_type and node_name else ""
                                 st.write(
-                                    f"**[{idx+1}]** `{display_filename}`{node_info}  "
+                                    f"**[{idx+1}]**{repo_tag} `{display_filename}`{node_info}  "
                                     f"L{start}–L{end}{tag}  ·  {score_icon} **{score_desc}** *({score_str})*"
                                 )
                                 if puid:

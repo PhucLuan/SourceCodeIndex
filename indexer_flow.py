@@ -166,9 +166,10 @@ class CodeEmbedding:
     puid: str        # Project Unique ID (định danh ngữ nghĩa: file::class::node)
     parent_puid: str # PUID của node cha (nếu có)
     is_skeleton: bool # True nếu node chỉ chứa chữ ký (signatures) cho RAG reasoning
+    repo_name: str   # Tên repository/thư mục nguồn rút gọn
 
 
-# ─── Helper: phát hiện test file ─────────────────────────────────────────────
+# ─── Helper: phát hiện test file & trích xuất repo_name ───────────────────────
 
 def _is_test_file(filepath: pathlib.PurePath) -> bool:
     """Kiểm tra xem file có phải test file không dựa trên tên file và đường dẫn."""
@@ -182,6 +183,29 @@ def _is_test_file(filepath: pathlib.PurePath) -> bool:
            for p in TEST_PATTERNS):
         return True
     return False
+
+
+def extract_repo_name(filepath: str) -> str:
+    """Trích xuất tên repository từ đường dẫn lưu trong workspace."""
+    normalized = filepath.replace("\\", "/")
+    prefix = "/tmp/workspace/"
+    if normalized.startswith(prefix):
+        relative = normalized[len(prefix):]
+    else:
+        parts = normalized.split("/")
+        if "workspace" in parts:
+            idx = parts.index("workspace")
+            relative = "/".join(parts[idx+1:])
+            if not relative:
+                relative = normalized
+        else:
+            relative = normalized
+    
+    subdir = relative.split("/")[0]
+    parts = subdir.rsplit('_', 1)
+    if len(parts) == 2 and len(parts[1]) == 6:
+        return parts[0]
+    return subdir
 
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
@@ -209,6 +233,7 @@ async def process_chunk(
     is_test: bool,
     id_gen: IdGenerator,
     table: postgres.TableTarget[CodeEmbedding],
+    repo_name: str,
 ) -> None:
     # Thêm prefix vào text để embedding hiểu ngữ cảnh tốt hơn (sử dụng profile.document_prefix)
     from embedder_config import load_active_profile
@@ -243,7 +268,8 @@ async def process_chunk(
             node_name=sanitize_for_pg(chunk.node_name),
             puid=sanitize_for_pg(puid),
             parent_puid=sanitize_for_pg(parent_puid),
-            is_skeleton=chunk.is_skeleton
+            is_skeleton=chunk.is_skeleton,
+            repo_name=sanitize_for_pg(repo_name),
         )
     )
 
@@ -278,6 +304,7 @@ async def process_file(
                 end_line=max(1, c.text.count('\n') + 1)
             ))
 
+    repo_name = extract_repo_name(str(filepath))
     id_gen = IdGenerator()
     await coco.map(
         process_chunk,
@@ -287,6 +314,7 @@ async def process_file(
         is_test,
         id_gen,
         table,
+        repo_name,
     )
 
 
@@ -295,6 +323,19 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
     from embedder_config import load_active_profile
     act_prof = load_active_profile()
     
+    # MIGRATION: Thêm cột repo_name nếu bảng đã tồn tại nhưng chưa có cột này.
+    # Chúng ta chạy trước mount_table_target để tránh lỗi khớp schema.
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        try:
+            table_exists = await pool.fetchval(
+                f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = '{PG_SCHEMA}' AND table_name = '{act_prof.table_name}')"
+            )
+            if table_exists:
+                await pool.execute(f'ALTER TABLE "{PG_SCHEMA}"."{act_prof.table_name}" ADD COLUMN IF NOT EXISTS repo_name VARCHAR')
+        except Exception as e:
+            sys.stderr.write(f"[MIGRATION WARNING] Failed to add repo_name column: {e}\n")
+            sys.stderr.flush()
+
     table_schema = await postgres.TableSchema.from_class(
         CodeEmbedding,
         primary_key=["id"],
@@ -445,21 +486,21 @@ async def _search_async(
 
     # Xây dựng SQL filter nếu có source_filters
     filter_sql = ""
+    final_source_filters = []
     if source_filters:
-        # Chuyển đổi các nguồn được chọn sang đúng tên thư mục trong workspace (/tmp/workspace/Project_Hash)
-        mapped_filters = [f"{WORKSPACE_DIR}/{get_workspace_subdir(f)}" for f in source_filters]
-        
-        conditions = []
-        for i, src in enumerate(mapped_filters):
-            conditions.append(f"filename LIKE ${i+3} || '%'")
-        filter_sql = "AND (" + " OR ".join(conditions) + ")"
-        # Cập nhật params cho SQL query
-        final_source_filters = mapped_filters
+        for f in source_filters:
+            dst_name = get_workspace_subdir(f)
+            parts = dst_name.rsplit('_', 1)
+            if len(parts) == 2 and len(parts[1]) == 6:
+                final_source_filters.append(parts[0])
+            else:
+                final_source_filters.append(dst_name)
+        filter_sql = "AND repo_name = ANY($3)"
 
     async with await asyncpg.create_pool(DATABASE_URL) as pool:
         async with pool.acquire() as conn:
             query = f"""
-                SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
+                SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton, repo_name,
                        1.0 - (embedding <=> $1) AS score
                 FROM "{PG_SCHEMA}"."{act_prof.table_name}"
                 WHERE 1=1 {filter_sql}
@@ -468,7 +509,7 @@ async def _search_async(
             """
             params = [str(query_vec.tolist()), top_k]
             if final_source_filters:
-                params.extend(final_source_filters)
+                params.append(final_source_filters)
             
             sys.stderr.write(f"[DEBUG] SQL Filter: {filter_sql}\n")
             sys.stderr.write(f"[DEBUG] Params (source filters): {final_source_filters}\n")
@@ -508,6 +549,7 @@ async def _search_async(
             "puid":       r["puid"],
             "parent_puid": r["parent_puid"],
             "is_skeleton": r["is_skeleton"],
+            "repo_name":   r.get("repo_name", ""),
         })
 
     return results
@@ -525,7 +567,7 @@ async def fetch_nodes_by_puid(
     act_prof = load_active_profile()
 
     query = f"""
-        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
+        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton, repo_name,
                1.0 AS score
         FROM "{PG_SCHEMA}"."{act_prof.table_name}"
         WHERE puid = ANY($1)
@@ -552,6 +594,7 @@ async def fetch_nodes_by_puid(
             "puid":       r["puid"],
             "parent_puid": r["parent_puid"],
             "is_skeleton": r["is_skeleton"],
+            "repo_name":   r.get("repo_name", ""),
         })
     return results
 
@@ -595,29 +638,31 @@ async def _fulltext_search_async(
     filter_sql = ""
     params: list = []
     
-    # We will format plainto_tsquery('english', $X) where X is the parameter index
-    
-    if source_filters:
-        mapped_filters = [f"{WORKSPACE_DIR}/{get_workspace_subdir(f)}" for f in source_filters]
-        conditions = []
-        for i, src in enumerate(mapped_filters):
-            param_idx = len(params) + 1
-            conditions.append(f"filename LIKE ${param_idx} || '%'")
-            params.append(src)
-        filter_sql = "AND (" + " OR ".join(conditions) + ")"
-
-    # The query text is the last parameter
-    param_idx_query = len(params) + 1
+    # The query text is parameter $1
     params.append(query_text)
     
+    if source_filters:
+        final_source_filters = []
+        for f in source_filters:
+            dst_name = get_workspace_subdir(f)
+            parts = dst_name.rsplit('_', 1)
+            if len(parts) == 2 and len(parts[1]) == 6:
+                final_source_filters.append(parts[0])
+            else:
+                final_source_filters.append(dst_name)
+        params.append(final_source_filters)
+        filter_sql = "AND repo_name = ANY($2)"
+
     param_idx_topk = len(params) + 1
     params.append(top_k)
+
+    param_idx_query = 1
 
     sql = f"""
         WITH query_ts AS (
             SELECT replace(plainto_tsquery('english', ${param_idx_query})::text, '&', '|')::tsquery AS q
         )
-        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton,
+        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton, repo_name,
                ts_rank_cd(text_search, query_ts.q) AS score
         FROM "{PG_SCHEMA}"."{act_prof.table_name}", query_ts
         WHERE text_search @@ query_ts.q
@@ -657,6 +702,7 @@ async def _fulltext_search_async(
             "puid": r["puid"],
             "parent_puid": r.get("parent_puid", ""),
             "is_skeleton": r.get("is_skeleton", False),
+            "repo_name": r.get("repo_name", ""),
         })
     return results
 

@@ -200,6 +200,7 @@ def query_cocoindex_db(
                     "puid":       r.get("puid", ""),
                     "parent_puid": r.get("parent_puid", ""),
                     "is_skeleton": r.get("is_skeleton", False),
+                    "repo_name":   r.get("repo_name", ""),
                 },
             )
             for r in enriched_results
