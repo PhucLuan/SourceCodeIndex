@@ -493,6 +493,9 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                                 puid = meta.get("puid", "")
                                 node_type = meta.get("node_type", "")
                                 node_name = meta.get("node_name", "")
+                                qualified_name = meta.get("qualified_name", "")
+                                source_span = meta.get("source_span", "")
+                                modifiers = meta.get("modifiers", "")
                                 
                                 tag = ""
                                 if is_test: tag += " 🧪 TEST"
@@ -536,6 +539,12 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                                 )
                                 if puid:
                                     st.caption(f"PUID: `{puid}`")
+                                if qualified_name:
+                                    st.caption(f"Qualified: `{qualified_name}`")
+                                if source_span:
+                                    st.caption(f"Span: `{source_span}`")
+                                if modifiers:
+                                    st.caption(f"Modifiers: `{modifiers}`")
                                 st.code(
                                     d.page_content,
                                     language=meta.get("lang", ""),

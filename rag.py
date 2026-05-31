@@ -340,6 +340,12 @@ def query_cocoindex_db(
                     "is_test":     r["is_test"],
                     "node_type":   r.get("node_type", ""),
                     "node_name":   r.get("node_name", ""),
+                    "qualified_name": r.get("qualified_name", ""),
+                    "signature":   r.get("signature", ""),
+                    "docstring":   r.get("docstring", ""),
+                    "modifiers":   r.get("modifiers", ""),
+                    "export_status": r.get("export_status", ""),
+                    "source_span": r.get("source_span", ""),
                     "puid":        r.get("puid", ""),
                     "parent_puid": r.get("parent_puid", ""),
                     "is_skeleton": r.get("is_skeleton", False),
@@ -410,6 +416,11 @@ Phân tích và trả lời bằng tiếng Việt hoặc tiếng Anh:"""
         is_test = meta.get("is_test", False)
         node_type = meta.get("node_type", "")
         node_name = meta.get("node_name", "")
+        qualified_name = meta.get("qualified_name", "")
+        signature = meta.get("signature", "")
+        source_span = meta.get("source_span", "")
+        docstring = meta.get("docstring", "")
+        modifiers = meta.get("modifiers", "")
         puid = meta.get("puid", "")
         is_skeleton = meta.get("is_skeleton", False)
         
@@ -418,10 +429,15 @@ Phân tích và trả lời bằng tiếng Việt hoặc tiếng Anh:"""
             tag += " [SKELETON/MỤC LỤC]"
 
         node_info = f" [{node_type.upper()}: {node_name}]" if node_type and node_name else ""
+        qname_info = f"\nQualified: {qualified_name}" if qualified_name else ""
+        sig_info = f"\nSignature: {signature}" if signature else ""
+        span_info = f"\nSpan: {source_span}" if source_span else ""
+        doc_info = f"\nDocstring: {docstring}" if docstring else ""
+        mod_info = f"\nModifiers: {modifiers}" if modifiers else ""
         puid_info = f"\nPUID: {puid}" if puid else ""
 
         context_parts.append(
-            f"--- {filename}:L{start}-L{end}{node_info}{tag}{puid_info} (relevance: {score:.3f}) ---\n"
+            f"--- {filename}:L{start}-L{end}{node_info}{tag}{qname_info}{sig_info}{span_info}{doc_info}{mod_info}{puid_info} (relevance: {score:.3f}) ---\n"
             f"{d.page_content}"
         )
 

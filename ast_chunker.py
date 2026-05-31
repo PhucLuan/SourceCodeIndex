@@ -1,4 +1,5 @@
 import logging
+import logging
 import sys
 import tree_sitter
 import tree_sitter_python
@@ -9,6 +10,16 @@ import tree_sitter_html
 import tree_sitter_css
 from dataclasses import dataclass, field
 from typing import List, Optional, Set
+
+from graph_node_contract import (
+    resolve_graph_node_kind,
+)
+from ast_extractors import (
+    build_modifiers,
+    extract_docstring,
+    extract_node_name,
+    extract_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,56 +79,50 @@ class AstChunk:
     node_name: str
     start_line: int
     end_line: int
+    qualified_name: str = ""
+    signature: str = ""
+    docstring: str = ""
+    modifiers: str = ""
+    export_status: str = "unknown"
+    source_span: str = ""
     is_skeleton: bool = False
     parent_name: Optional[str] = None
+    parent_node_type: Optional[str] = ""
+    parent_qualified_name: Optional[str] = ""
     references: List[str] = field(default_factory=list)
 
 def get_node_name(node, source_bytes: bytes) -> str:
-    """Lấy tên của node (class, function, arrow function, tag...)."""
-    # 1. Thử các field chuẩn
-    for field_name in ['name', 'identifier']:
-        name_node = node.child_by_field_name(field_name)
-        if name_node:
-            return source_bytes[name_node.start_byte:name_node.end_byte].decode('utf-8')
-    
-    # 2. Xử lý Arrow Function (const name = () => ...)
-    # Thường arrow_function là con của variable_declarator
-    if node.type == 'arrow_function':
-        parent = node.parent
-        if parent and parent.type == 'variable_declarator':
-            id_node = parent.child_by_field_name('name')
-            if id_node:
-                return source_bytes[id_node.start_byte:id_node.end_byte].decode('utf-8')
-
-    # 3. Xử lý HTML Element
-    if node.type == 'element':
-        start_tag = node.child_by_field_name('start_tag')
-        if start_tag:
-            tag_name_node = start_tag.child_by_field_name('name')
-            if tag_name_node:
-                return f"<{source_bytes[tag_name_node.start_byte:tag_name_node.end_byte].decode('utf-8')}>"
-        return "<html>"
-
-    # 4. Xử lý CSS Rule Set
-    if node.type == 'rule_set':
-        selectors = node.child_by_field_name('selectors')
-        if selectors:
-            return source_bytes[selectors.start_byte:selectors.end_byte].decode('utf-8').strip()
-        return "css_rule"
-
-    # 5. Tìm con là identifier
-    for child in node.children:
-        if child.type == 'identifier':
-            return source_bytes[child.start_byte:child.end_byte].decode('utf-8')
-            
-    return "unknown"
+    """Backward-compatible wrapper for shared node-name extraction."""
+    return extract_node_name(node, source_bytes)
 
 def get_signature(node, source_bytes: bytes) -> str:
-    """Lấy dòng khai báo (chữ ký) của node."""
-    # Thường là dòng đầu tiên của node hoặc đến khi gặp '{' hoặc ':'
-    text = source_bytes[node.start_byte:node.end_byte].decode('utf-8')
-    first_line = text.split('\n')[0].strip()
-    return first_line
+    """Backward-compatible wrapper for shared signature extraction."""
+    return extract_signature(node, source_bytes)
+
+
+def _extract_python_docstring(node, source_bytes: bytes) -> str:
+    """Backward-compatible wrapper for shared docstring extraction."""
+    return extract_docstring(node, source_bytes, "python")
+
+
+def _extract_modifiers(node_text: str, lang: str, node_type: str, export_status: str) -> str:
+    """Backward-compatible wrapper for shared modifier extraction."""
+    return build_modifiers(node_text, lang, node_type, export_status)
+
+
+def _resolve_graph_node_kind(
+    lang: str,
+    raw_kind: str,
+    current_parent_type: Optional[str],
+    is_skeleton: bool,
+) -> str:
+    """Backward-compatible wrapper for the shared graph node resolver."""
+    return resolve_graph_node_kind(
+        lang,
+        raw_kind,
+        current_parent_type=current_parent_type,
+        is_skeleton=is_skeleton,
+    )
 
 def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
     """
@@ -127,13 +132,7 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
     chunks = []
 
     if not parser:
-        chunks = [AstChunk(
-            text=text, 
-            node_type="file", 
-            node_name="global", 
-            start_line=1, 
-            end_line=max(1, text.count('\n') + 1)
-        )]
+        chunks = []
     else:
         source_bytes = text.encode('utf-8')
         tree = parser.parse(source_bytes)
@@ -154,9 +153,10 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
         # Stage 1: Thu thập tất cả các node và phân cấp
         file_skeletons = []
         
-        def traverse(node, current_parent=None):
+        def traverse(node, current_parent=None, current_parent_type=None, current_qualified=None):
             if node.type in target_types:
-                node_name = get_node_name(node, source_bytes)
+                node_name = extract_node_name(node, source_bytes)
+                qualified_name = f"{current_qualified}.{node_name}" if current_qualified else node_name
                 
                 # Bắt đầu và kết thúc mặc định
                 start_byte = node.start_byte
@@ -179,36 +179,52 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
                     prev = prev.prev_sibling
 
                 node_text = source_bytes[start_byte:end_byte].decode('utf-8')
-                node_type = node.type.replace("_definition", "").replace("_declaration", "")
+                node_type = _resolve_graph_node_kind(
+                    lang,
+                    node.type,
+                    current_parent_type,
+                    is_skeleton=False,
+                )
+                docstring = extract_docstring(node, source_bytes, lang)
+                export_status = "exported" if node.parent and node.parent.type == "export_statement" else "internal"
+                modifiers = build_modifiers(node_text, lang, node_type, export_status)
                 
                 # Tạo chunk nội dung đầy đủ
                 chunk = AstChunk(
                     text=node_text,
                     node_type=node_type,
                     node_name=node_name,
+                    qualified_name=qualified_name,
+                    signature=extract_signature(node, source_bytes),
+                    docstring=docstring,
+                    modifiers=modifiers,
+                    export_status=export_status,
                     start_line=node.start_point.row + 1,
                     end_line=node.end_point.row + 1,
-                    parent_name=current_parent
+                    source_span=f"L{node.start_point.row + 1}-L{node.end_point.row + 1}",
+                    parent_name=current_parent,
+                    parent_node_type=current_parent_type or "",
+                    parent_qualified_name=current_qualified or ""
                 )
                 chunks.append(chunk)
                 
                 # Lưu chữ ký để làm skeleton
-                sig = get_signature(node, source_bytes)
-                file_skeletons.append((node_type, node_name, sig, current_parent))
+                sig = extract_signature(node, source_bytes)
+                file_skeletons.append((node_type, node_name, sig, current_parent, qualified_name))
                 
                 # Đệ quy vào con với parent mới
                 for child in node.children:
-                    traverse(child, current_parent=node_name)
+                    traverse(child, current_parent=node_name, current_parent_type=node_type, current_qualified=qualified_name)
             else:
                 for child in node.children:
-                    traverse(child, current_parent=current_parent)
+                    traverse(child, current_parent=current_parent, current_parent_type=current_parent_type, current_qualified=current_qualified)
 
         traverse(tree.root_node)
 
         # Stage 2: Tạo Skeleton Nodes ("Mục lục") cho các Class/Interface
         # Nhóm các signatures theo parent
         skeletons_by_parent = {}
-        for n_type, n_name, sig, parent in file_skeletons:
+        for n_type, n_name, sig, parent, qualified_name in file_skeletons:
             if parent not in skeletons_by_parent:
                 skeletons_by_parent[parent] = []
             skeletons_by_parent[parent].append(f"  - {n_type}: {sig}")
@@ -216,10 +232,12 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
         for parent, items in skeletons_by_parent.items():
             if parent is None:
                 s_name = "Global Table of Contents"
-                s_type = "file_skeleton"
+                s_type = "concept"
+                skeleton_qname = "global"
             else:
                 s_name = f"{parent} Skeleton"
-                s_type = "class_skeleton"
+                s_type = "concept"
+                skeleton_qname = parent
             
             skeleton_text = f"Skeleton for {s_name}:\n" + "\n".join(items)
             
@@ -227,8 +245,13 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
                 text=skeleton_text,
                 node_type=s_type,
                 node_name=s_name,
+                qualified_name=skeleton_qname,
+                signature=items[0] if items else "",
+                modifiers="summary",
+                export_status="internal",
                 start_line=1,
                 end_line=1,
+                source_span="L1-L1",
                 is_skeleton=True
             ))
 
@@ -237,6 +260,8 @@ def extract_ast_nodes(text: str, lang: str) -> List[AstChunk]:
                 text=text,
                 node_type="file",
                 node_name="global",
+                qualified_name="global",
+                modifiers="",
                 start_line=1,
                 end_line=max(1, text.count('\n') + 1)
             ))

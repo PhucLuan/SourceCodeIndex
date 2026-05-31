@@ -47,6 +47,7 @@ from cocoindex.resources.id import IdGenerator
 from sentence_transformers import SentenceTransformer
 
 from ast_chunker import extract_ast_nodes
+from graph_node_contract import canonicalize_node_kind
 
 
 # ─── Cấu hình ────────────────────────────────────────────────────────────────
@@ -167,6 +168,12 @@ class CodeEmbedding:
     parent_puid: str # PUID của node cha (nếu có)
     is_skeleton: bool # True nếu node chỉ chứa chữ ký (signatures) cho RAG reasoning
     repo_name: str   # Tên repository/thư mục nguồn rút gọn
+    qualified_name: str = ""
+    signature: str = ""
+    docstring: str = ""
+    modifiers: str = ""
+    export_status: str = "unknown"
+    source_span: str = ""
 
 
 # ─── Helper: phát hiện test file & trích xuất repo_name ───────────────────────
@@ -208,6 +215,69 @@ def extract_repo_name(filepath: str) -> str:
     return subdir
 
 
+def extract_workspace_relative_path(filepath: str) -> str:
+    """Return the path inside the repo/workspace, excluding the repo folder prefix."""
+    normalized = filepath.replace("\\", "/")
+    prefix = "/tmp/workspace/"
+    if normalized.startswith(prefix):
+        relative = normalized[len(prefix):]
+    else:
+        parts = normalized.split("/")
+        if "workspace" in parts:
+            idx = parts.index("workspace")
+            relative = "/".join(parts[idx + 1 :])
+        else:
+            relative = normalized
+
+    parts = relative.split("/", 1)
+    if len(parts) == 2 and "_" in parts[0]:
+        return parts[1]
+    return relative
+
+
+def normalize_puid(
+    repo_name: str,
+    relative_path: str,
+    kind: str,
+    qualified_name: str,
+) -> str:
+    """Build a stable graph identifier for a node."""
+    repo = sanitize_for_pg(repo_name).strip() or "unknown_repo"
+    rel_path = sanitize_for_pg(relative_path).replace("\\", "/").strip().strip("/")
+    node_kind = sanitize_for_pg(kind).strip() or "node"
+    qname = sanitize_for_pg(qualified_name).replace("\\", "/").strip()
+    return f"{repo}::{rel_path}::{node_kind}::{qname}"
+
+
+def _build_file_chunk(filepath: pathlib.PurePath, text: str, lang: str):
+    """Create a synthetic file-level chunk for every source file."""
+    from ast_chunker import AstChunk
+
+    relative_path = extract_workspace_relative_path(str(filepath))
+    line_count = max(1, text.count("\n") + 1)
+    preview = text[:1600].rstrip()
+    node_name = filepath.name or "global"
+    return AstChunk(
+        text=(
+            f"File: {relative_path}\n"
+            f"Language: {lang or 'unknown'}\n"
+            f"QualifiedName: {relative_path}\n"
+            f"SourceSpan: L1-L{line_count}\n\n"
+            f"{preview}"
+        ),
+        node_type="file",
+        node_name=node_name,
+        qualified_name=relative_path,
+        signature=relative_path,
+        docstring="",
+        modifiers="",
+        export_status="internal",
+        start_line=1,
+        end_line=line_count,
+        source_span=f"L1-L{line_count}",
+    )
+
+
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @coco.lifespan
@@ -239,14 +309,43 @@ async def process_chunk(
     from embedder_config import load_active_profile
     _prof = load_active_profile()
     prefix = _prof.document_prefix or ""
+    relative_path = extract_workspace_relative_path(str(filename))
     parent_info = f"Parent: {chunk.parent_name}\n" if chunk.parent_name else ""
-    enriched_text = f"{prefix}File: {filename}\n{parent_info}Type: {chunk.node_type}\nName: {chunk.node_name}\n\n{chunk.text}"
+    qname = chunk.qualified_name or chunk.node_name
+    node_kind = canonicalize_node_kind(
+        chunk.node_type,
+        is_file_node=chunk.node_type == "file",
+        is_skeleton=chunk.is_skeleton,
+    )
+    meta_info = (
+        f"File: {relative_path}\n"
+        f"QualifiedName: {qname}\n"
+        f"Type: {node_kind}\n"
+        f"Name: {chunk.node_name}\n"
+    )
+    if chunk.signature:
+        meta_info += f"Signature: {chunk.signature}\n"
+    if chunk.source_span:
+        meta_info += f"SourceSpan: {chunk.source_span}\n"
+    if chunk.docstring:
+        meta_info += f"Docstring: {chunk.docstring}\n"
+    if chunk.modifiers:
+        meta_info += f"Modifiers: {chunk.modifiers}\n"
+    if chunk.export_status:
+        meta_info += f"ExportStatus: {chunk.export_status}\n"
+    enriched_text = f"{prefix}{meta_info}{parent_info}\n{chunk.text}"
     async with _embed_sem:
         embedding = await coco.use_context(EMBEDDER).embed(enriched_text)
 
     # Tạo Semantic PUID
-    puid = f"{filename}::{chunk.node_name}"
-    parent_puid = f"{filename}::{chunk.parent_name}" if chunk.parent_name else ""
+    puid = normalize_puid(repo_name, relative_path, node_kind, qname)
+    if chunk.parent_qualified_name:
+        parent_kind = chunk.parent_node_type or "node"
+        parent_puid = normalize_puid(repo_name, relative_path, parent_kind, chunk.parent_qualified_name)
+    elif chunk.node_type == "file":
+        parent_puid = ""
+    else:
+        parent_puid = normalize_puid(repo_name, relative_path, "file", relative_path)
 
     # === [DEBUG_LOG_START] ===
     skeleton_tag = "[SKELETON]" if chunk.is_skeleton else "[CONTENT]"
@@ -264,12 +363,18 @@ async def process_chunk(
             start_line=chunk.start_line,
             end_line=chunk.end_line,
             is_test=is_test,
-            node_type=sanitize_for_pg(chunk.node_type),
+            node_type=sanitize_for_pg(node_kind),
             node_name=sanitize_for_pg(chunk.node_name),
             puid=sanitize_for_pg(puid),
             parent_puid=sanitize_for_pg(parent_puid),
             is_skeleton=chunk.is_skeleton,
             repo_name=sanitize_for_pg(repo_name),
+            qualified_name=sanitize_for_pg(qname),
+            signature=sanitize_for_pg(chunk.signature),
+            docstring=sanitize_for_pg(chunk.docstring),
+            modifiers=sanitize_for_pg(chunk.modifiers),
+            export_status=sanitize_for_pg(chunk.export_status),
+            source_span=sanitize_for_pg(chunk.source_span or f"L{chunk.start_line}-L{chunk.end_line}"),
         )
     )
 
@@ -287,6 +392,8 @@ async def process_file(
     lang = detect_code_language(filename=str(filepath.name)) or ""
     is_test = _is_test_file(filepath)
 
+    newline = '\n'
+    
     if lang in SUPPORTED_AST_LANGS:
         chunks = extract_ast_nodes(text, lang)
     else:
@@ -297,12 +404,21 @@ async def process_file(
         chunks = []
         for i, c in enumerate(text_chunks):
             chunks.append(AstChunk(
-                text=c.text,
-                node_type="file_chunk",
-                node_name=f"chunk_{i}",
-                start_line=1, # Tạm thời để 1
-                end_line=max(1, c.text.count('\n') + 1)
-            ))
+                    text=c.text,
+                    node_type="file_chunk",
+                    node_name=f"chunk_{i}",
+                    start_line=1, # Tạm thời để 1
+                    end_line=max(1, c.text.count('\n') + 1),
+                    qualified_name=f"{filepath.name}#chunk_{i}",
+                    signature=c.text.splitlines()[0].strip() if c.text.splitlines() else "",
+                    docstring="",
+                    modifiers="",
+                    export_status="internal",
+                    source_span=f"L1-L{max(1, c.text.count(newline) + 1)}",
+                ))
+
+    file_chunk = _build_file_chunk(filepath, text, lang)
+    chunks = [file_chunk] + chunks
 
     repo_name = extract_repo_name(str(filepath))
     id_gen = IdGenerator()
@@ -331,7 +447,16 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
                 f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = '{PG_SCHEMA}' AND table_name = '{act_prof.table_name}')"
             )
             if table_exists:
-                await pool.execute(f'ALTER TABLE "{PG_SCHEMA}"."{act_prof.table_name}" ADD COLUMN IF NOT EXISTS repo_name VARCHAR')
+                for column_sql in [
+                    'ADD COLUMN IF NOT EXISTS repo_name VARCHAR',
+                    'ADD COLUMN IF NOT EXISTS qualified_name VARCHAR',
+                    'ADD COLUMN IF NOT EXISTS signature VARCHAR',
+                    'ADD COLUMN IF NOT EXISTS docstring TEXT',
+                    'ADD COLUMN IF NOT EXISTS modifiers VARCHAR',
+                    'ADD COLUMN IF NOT EXISTS export_status VARCHAR',
+                    'ADD COLUMN IF NOT EXISTS source_span VARCHAR',
+                ]:
+                    await pool.execute(f'ALTER TABLE "{PG_SCHEMA}"."{act_prof.table_name}" {column_sql}')
         except Exception as e:
             sys.stderr.write(f"[MIGRATION WARNING] Failed to add repo_name column: {e}\n")
             sys.stderr.flush()
@@ -441,6 +566,31 @@ def rrf_merge(vector_results, bm25_results, k: int = 60):
     # Sort by the RRF score descending
     return sorted_merged
 
+
+def _row_to_result(r) -> dict:
+    """Normalize a database row into the dict shape used by search callers."""
+    return {
+        "filename":    r["filename"],
+        "lang":        r["lang"],
+        "text":        r["text"],
+        "score":       float(r["score"]),
+        "start_line":  r["start_line"],
+        "end_line":    r["end_line"],
+        "is_test":     r["is_test"],
+        "node_type":   r.get("node_type", ""),
+        "node_name":   r.get("node_name", ""),
+        "qualified_name": r.get("qualified_name", ""),
+        "signature":   r.get("signature", ""),
+        "docstring":   r.get("docstring", ""),
+        "modifiers":   r.get("modifiers", ""),
+        "export_status": r.get("export_status", ""),
+        "source_span": r.get("source_span", ""),
+        "puid":        r["puid"],
+        "parent_puid": r.get("parent_puid", ""),
+        "is_skeleton": r.get("is_skeleton", False),
+        "repo_name":   r.get("repo_name", ""),
+    }
+
 async def _search_async(
     query_text: str,
     top_k: int = TOP_K,
@@ -504,7 +654,7 @@ async def _search_async(
     async with await asyncpg.create_pool(DATABASE_URL, init=_init) as pool:
         async with pool.acquire() as conn:
             query = f"""
-                SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton, repo_name,
+                SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, qualified_name, signature, docstring, modifiers, export_status, source_span, puid, parent_puid, is_skeleton, repo_name,
                        1.0 - (embedding <=> $1) AS score
                 FROM "{PG_SCHEMA}"."{act_prof.table_name}"
                 WHERE 1=1 {filter_sql}
@@ -538,25 +688,7 @@ async def _search_async(
     # === [DEBUG_LOG_END] ===
 
     # Chuyển đổi kết quả sang list dict
-    results = []
-    for r in rows:
-        results.append({
-            "filename":   r["filename"],
-            "lang":       r["lang"],
-            "text":       r["text"],
-            "score":      float(r["score"]),
-            "start_line": r["start_line"],
-            "end_line":   r["end_line"],
-            "is_test":    r["is_test"],
-            "node_type":  r["node_type"],
-            "node_name":  r["node_name"],
-            "puid":       r["puid"],
-            "parent_puid": r["parent_puid"],
-            "is_skeleton": r["is_skeleton"],
-            "repo_name":   r.get("repo_name", ""),
-        })
-
-    return results
+    return [_row_to_result(r) for r in rows]
 
 
 async def fetch_nodes_by_puid(
@@ -571,7 +703,7 @@ async def fetch_nodes_by_puid(
     act_prof = load_active_profile()
 
     query = f"""
-        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton, repo_name,
+        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, qualified_name, signature, docstring, modifiers, export_status, source_span, puid, parent_puid, is_skeleton, repo_name,
                1.0 AS score
         FROM "{PG_SCHEMA}"."{act_prof.table_name}"
         WHERE puid = ANY($1)
@@ -583,24 +715,7 @@ async def fetch_nodes_by_puid(
         async with pool.acquire() as conn:
             rows = await conn.fetch(query, puids)
 
-    results = []
-    for r in rows:
-        results.append({
-            "filename":   r["filename"],
-            "lang":       r["lang"],
-            "text":       r["text"],
-            "score":      float(r["score"]),
-            "start_line": r["start_line"],
-            "end_line":   r["end_line"],
-            "is_test":    r["is_test"],
-            "node_type":  r["node_type"],
-            "node_name":  r["node_name"],
-            "puid":       r["puid"],
-            "parent_puid": r["parent_puid"],
-            "is_skeleton": r["is_skeleton"],
-            "repo_name":   r.get("repo_name", ""),
-        })
-    return results
+    return [_row_to_result(r) for r in rows]
 
 
 def fetch_nodes(
@@ -666,7 +781,7 @@ async def _fulltext_search_async(
         WITH query_ts AS (
             SELECT replace(plainto_tsquery('english', ${param_idx_query})::text, '&', '|')::tsquery AS q
         )
-        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, puid, parent_puid, is_skeleton, repo_name,
+        SELECT filename, lang, text, start_line, end_line, is_test, node_type, node_name, qualified_name, signature, docstring, modifiers, export_status, source_span, puid, parent_puid, is_skeleton, repo_name,
                ts_rank_cd(text_search, query_ts.q) AS score
         FROM "{PG_SCHEMA}"."{act_prof.table_name}", query_ts
         WHERE text_search @@ query_ts.q
@@ -691,24 +806,7 @@ async def _fulltext_search_async(
     sys.stderr.write("=============================================\n")
     sys.stderr.flush()
 
-    results = []
-    for r in rows:
-        results.append({
-            "filename": r["filename"],
-            "lang": r["lang"],
-            "text": r["text"],
-            "score": float(r["score"]),
-            "start_line": r["start_line"],
-            "end_line": r["end_line"],
-            "is_test": r["is_test"],
-            "node_type": r.get("node_type", ""),
-            "node_name": r.get("node_name", ""),
-            "puid": r["puid"],
-            "parent_puid": r.get("parent_puid", ""),
-            "is_skeleton": r.get("is_skeleton", False),
-            "repo_name": r.get("repo_name", ""),
-        })
-    return results
+    return [_row_to_result(r) for r in rows]
 
 
 def fulltext_search(
@@ -783,7 +881,7 @@ async def _search_per_repo_async(
         async with pool.acquire() as conn:
             sql = f"""
                 SELECT filename, lang, text, start_line, end_line,
-                       is_test, node_type, node_name, puid, parent_puid,
+                       is_test, node_type, node_name, qualified_name, signature, docstring, modifiers, export_status, source_span, puid, parent_puid,
                        is_skeleton, repo_name,
                        1.0 - (embedding <=> $1) AS score
                 FROM "{PG_SCHEMA}"."{act_prof.table_name}"
@@ -793,24 +891,7 @@ async def _search_per_repo_async(
             """
             rows = await conn.fetch(sql, query_vec.tolist(), repo_name, top_k)
 
-    return [
-        {
-            "filename":    r["filename"],
-            "lang":        r["lang"],
-            "text":        r["text"],
-            "score":       float(r["score"]),
-            "start_line":  r["start_line"],
-            "end_line":    r["end_line"],
-            "is_test":     r["is_test"],
-            "node_type":   r.get("node_type", ""),
-            "node_name":   r.get("node_name", ""),
-            "puid":        r["puid"],
-            "parent_puid": r.get("parent_puid", ""),
-            "is_skeleton": r.get("is_skeleton", False),
-            "repo_name":   r.get("repo_name", ""),
-        }
-        for r in rows
-    ]
+    return [_row_to_result(r) for r in rows]
 
 
 def search_per_repo(
@@ -846,7 +927,7 @@ async def _fulltext_search_per_repo_async(
             SELECT replace(plainto_tsquery('english', $1)::text, '&', '|')::tsquery AS q
         )
         SELECT filename, lang, text, start_line, end_line,
-               is_test, node_type, node_name, puid, parent_puid,
+               is_test, node_type, node_name, qualified_name, signature, docstring, modifiers, export_status, source_span, puid, parent_puid,
                is_skeleton, repo_name,
                ts_rank_cd(text_search, query_ts.q) AS score
         FROM "{PG_SCHEMA}"."{act_prof.table_name}", query_ts
@@ -859,24 +940,7 @@ async def _fulltext_search_per_repo_async(
         async with pool.acquire() as conn:
             rows = await conn.fetch(sql, query_text, repo_name, top_k)
 
-    return [
-        {
-            "filename":    r["filename"],
-            "lang":        r["lang"],
-            "text":        r["text"],
-            "score":       float(r["score"]),
-            "start_line":  r["start_line"],
-            "end_line":    r["end_line"],
-            "is_test":     r["is_test"],
-            "node_type":   r.get("node_type", ""),
-            "node_name":   r.get("node_name", ""),
-            "puid":        r["puid"],
-            "parent_puid": r.get("parent_puid", ""),
-            "is_skeleton": r.get("is_skeleton", False),
-            "repo_name":   r.get("repo_name", ""),
-        }
-        for r in rows
-    ]
+    return [_row_to_result(r) for r in rows]
 
 
 def fulltext_search_per_repo(
