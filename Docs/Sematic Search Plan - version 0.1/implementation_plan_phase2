@@ -1,0 +1,58 @@
+# Phase 2: Xây dựng Code Graph & Relationships (Tham chiếu & Kế thừa)
+
+Mục tiêu của giai đoạn này là giúp hệ thống hiểu được mối liên kết giữa các thành phần code khác nhau. Thay vì chỉ tìm kiếm dựa trên sự tương đồng văn bản (Semantic Search), hệ thống sẽ có khả năng "nhảy" từ một lời gọi hàm sang định nghĩa của hàm đó ở một file khác.
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Độ chính xác của Reference Extraction:** Do chúng ta không sử dụng bộ compiler đầy đủ (như Roslyn cho C# hay Pyright cho Python), việc phân giải tham chiếu (Symbol Resolution) sẽ dựa trên phương pháp "Best Effort" (khớp tên và namespace). Điều này có nghĩa là nếu có 2 hàm trùng tên ở 2 namespace khác nhau, hệ thống có thể nhầm lẫn nếu không đủ thông tin import.
+
+## Proposed Changes
+
+### 1. [Component] AST Chunker (Enrichment)
+
+Nâng cấp logic bóc tách để không chỉ lấy nội dung mà còn lấy danh sách các "Outbound Edges".
+
+#### [MODIFY] [ast_chunker.py](file:///d:/LearnAI/CocoIndexDemo/SourceIndexingCocoIndex/SourceCodeIndex/ast_chunker.py)
+- Bổ sung logic truy vấn Tree-sitter để tìm các node:
+    - **Python:** `call` (gọi hàm), `base_classes` (kế thừa), `import_from_statement`.
+    - **C#:** `invocation_expression`, `base_list`.
+- Mỗi code chunk trả về sẽ có thêm trường `references: list[dict]` chứa `{name: str, type: str}`.
+
+---
+
+### 2. [Component] Database Schema (Graph Storage)
+
+Cần một cấu trúc để lưu trữ các quan hệ này hiệu quả.
+
+#### [NEW] `code_relationships` Table (PostgreSQL)
+Lưu trữ các cạnh (edges) của đồ thị:
+- `source_id`: UUID của node gốc (foreign key tới `code_embeddings`).
+- `target_symbol`: Tên symbol được tham chiếu (ví dụ: "CreateAsset").
+- `relationship_type`: "calls", "inherits", "imports".
+- `target_node_id`: (Nullable) UUID của node đích nếu hệ thống phân giải được.
+
+---
+
+### 3. [Component] Indexer Flow (Symbol Resolution)
+
+#### [MODIFY] [indexer_flow.py](file:///d:/LearnAI/CocoIndexDemo/SourceIndexingCocoIndex/SourceCodeIndex/indexer_flow.py)
+- **Bước 1: Scan & Store:** Lưu toàn bộ code chunks như hiện tại.
+- **Bước 2: Symbol Mapping:** Tạo một bảng ánh xạ `(node_name, filepath) -> node_id`.
+- **Bước 3: Linker:** Chạy một process hậu kỳ để duyệt qua `code_relationships`, tìm `target_node_id` phù hợp nhất dựa trên `target_symbol` và ngữ cảnh import.
+
+---
+
+### 4. [Component] RAG Engine (Graph Context)
+
+#### [MODIFY] [rag.py](file:///d:/LearnAI/CocoIndexDemo/SourceIndexingCocoIndex/SourceCodeIndex/rag.py)
+- Khi thực hiện search, ngoài việc lấy Top-K nodes tương đồng, hệ thống sẽ thực hiện thêm 1 bước:
+    - Tìm các "Neighbors" (các node mà node hiện tại gọi tới hoặc bị gọi bởi).
+    - Gộp các Neighbors này vào Context gửi cho LLM với ghi chú: *"Đây là các đoạn code liên quan trực tiếp qua quan hệ tham chiếu"*.
+
+## Verification Plan
+
+### Manual Verification
+- Index một project C# có cấu trúc kế thừa rõ ràng (ví dụ: `AssetService` kế thừa `IBaseService`).
+- Đặt câu hỏi: *"Hàm CreateAsset gọi những thành phần nào?"*.
+- Kiểm tra xem LLM có thể liệt kê được các hàm ở file khác mà nó không trực tiếp tìm thấy qua Semantic Search hay không.

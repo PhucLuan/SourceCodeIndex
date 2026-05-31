@@ -1,0 +1,134 @@
+[
+  {
+    "id": "Q01",
+    "query": "File nao import module nay?",
+    "intent": "imports",
+    "expected_evidence": [
+      "source files with imports edges",
+      "module or file citations"
+    ],
+    "expected_failure_mode": [
+      "returns only semantically similar snippets",
+      "does not invent import edges"
+    ]
+  },
+  {
+    "id": "Q02",
+    "query": "Function A goi function nao?",
+    "intent": "calls",
+    "expected_evidence": [
+      "direct callee list",
+      "line-level citation for the call site"
+    ],
+    "expected_failure_mode": [
+      "returns nearby code without call edges",
+      "does not hallucinate callee names"
+    ]
+  },
+  {
+    "id": "Q03",
+    "query": "Class nay co nhung method nao?",
+    "intent": "contains",
+    "expected_evidence": [
+      "class node",
+      "child methods"
+    ],
+    "expected_failure_mode": [
+      "returns method-like text only",
+      "does not claim child membership without evidence"
+    ]
+  },
+  {
+    "id": "Q04",
+    "query": "Diem bat dau cua feature login la gi?",
+    "intent": "entrypoint",
+    "expected_evidence": [
+      "entrypoint file",
+      "route or controller",
+      "service chain"
+    ],
+    "expected_failure_mode": [
+      "only returns top semantic match",
+      "no explicit flow chain"
+    ]
+  },
+  {
+    "id": "Q05",
+    "query": "Neu sua ham validate thi anh huong toi dau?",
+    "intent": "impact",
+    "expected_evidence": [
+      "reverse dependency tree",
+      "dependent callers or files"
+    ],
+    "expected_failure_mode": [
+      "returns unrelated similar code",
+      "no reverse edge reasoning"
+    ]
+  },
+  {
+    "id": "Q06",
+    "query": "Module nao xu ly auth?",
+    "intent": "semantic",
+    "expected_evidence": [
+      "top relevant nodes",
+      "optional graph expansion"
+    ],
+    "expected_failure_mode": [
+      "overly broad results without ranking",
+      "missing citations"
+    ]
+  },
+  {
+    "id": "Q07",
+    "query": "Cho toi luong xu ly request tu UI toi API",
+    "intent": "business flow",
+    "expected_evidence": [
+      "UI to controller chain",
+      "service and data nodes"
+    ],
+    "expected_failure_mode": [
+      "no multi-hop traversal",
+      "returns isolated snippets only"
+    ]
+  },
+  {
+    "id": "Q08",
+    "query": "Co function nao ten gan giong AddAsync khong?",
+    "intent": "fuzzy symbol",
+    "expected_evidence": [
+      "exact symbol",
+      "near matches"
+    ],
+    "expected_failure_mode": [
+      "semantic-only retrieval misses symbol proximity",
+      "no fuzzy symbol lookup"
+    ]
+  },
+  {
+    "id": "Q09",
+    "query": "File nao test function nay?",
+    "intent": "tested_by",
+    "expected_evidence": [
+      "test file names",
+      "test edge if available"
+    ],
+    "expected_failure_mode": [
+      "returns generic references",
+      "does not identify test coverage"
+    ]
+  },
+  {
+    "id": "Q10",
+    "query": "Ve cho toi graph cua call chain nay",
+    "intent": "graph output",
+    "expected_evidence": [
+      "Mermaid diagram or adjacency list",
+      "actual call chain nodes"
+    ],
+    "expected_failure_mode": [
+      "plain snippet dump",
+      "graph not represented explicitly"
+    ]
+  }
+]
+

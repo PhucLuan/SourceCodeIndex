@@ -1,0 +1,342 @@
+# Phase 2.2 — Full-Stack Semantic Indexing & Smart Retrieval
+
+Mục tiêu nâng cấp toàn diện khả năng đánh Index và tìm kiếm, với trọng tâm là mã nguồn **Frontend** (Angular: TypeScript, JavaScript, HTML, CSS, SCSS) trong khi vẫn giữ và cải thiện chất lượng cho **Backend** (C#).
+
+---
+
+## Bài Toán 1: Chất Lượng Index Frontend Kém Hơn Backend
+
+### Nguyên nhân gốc rễ
+
+Chunker hiện tại (`ast_chunker.py`) được thiết kế tốt cho C# (OOP chặt chẽ: Namespace → Class → Method) nhưng bỏ sót nhiều cấu trúc của Frontend:
+
+| Vấn đề | Chi tiết |
+|--------|----------|
+| **Arrow Functions bị bỏ sót** | TS/JS frontend dùng nhiều `const myFn = () => {}`. Tree-sitter phân loại đây là `variable_declaration` + `arrow_function`, **không phải** `function_declaration` — nên chunker hiện tại bỏ qua hoàn toàn. |
+| **HTML/CSS/SCSS coi là Plain Text** | `ast_chunker.py` chưa load Parser cho HTML/CSS/SCSS. Toàn bộ file HTML/CSS bị đổ vào 1 chunk "global" duy nhất — mất khả năng tìm chính xác Component/Selector cụ thể. |
+| **Angular Decorator bị bỏ qua** | `@Component`, `@Injectable`, `@NgModule` là metadata cực kỳ quan trọng của Angular nhưng không được capture. |
+| **Angular Template Syntax** | `*ngIf`, `[(ngModel)]`, `{{ binding }}` là cú pháp riêng của Angular trong HTML — parser `tree-sitter-html` chuẩn không hiểu được. |
+
+### Các giải pháp khả thi
+
+**Giải pháp A: Universal Fallback (CocoIndex SplitRecursively)**
+- Dùng `SplitRecursively` của CocoIndex làm nền tảng chung cho mọi ngôn ngữ.
+- *Ưu:* Đơn giản, ít code, CocoIndex tự chọn đúng Tree-sitter grammar theo extension.
+- *Nhược:* Không lấy được Metadata phong phú (tên hàm, decorator), không tạo được Skeleton Index.
+
+**Giải pháp B: Custom Parser riêng cho từng ngôn ngữ**
+- Tiếp tục mở rộng `ast_chunker.py` cho từng ngôn ngữ mới.
+- *Ưu:* Metadata phong phú, Skeleton Index, PUID chính xác.
+- *Nhược:* Tốn công bảo trì, phức tạp khi thêm ngôn ngữ mới.
+
+**Giải pháp C: Hybrid — Được chọn** ✅
+- **Tầng 1 (Custom AST):** Giữ và cải thiện custom parser cho các ngôn ngữ trọng tâm (C#, TS/JS). Thêm `tree-sitter-html` và `tree-sitter-css`.
+- **Tầng 2 (Universal Fallback):** Với các file không có custom parser (SCSS, JSON config...), dùng **`SplitRecursively` của CocoIndex** — nó đã tích hợp Tree-sitter nên không cắt nhầm giữa một CSS rule hay block cú pháp, đồng thời giảm thiểu code tự viết.
+- *Lý do chọn:* Cân bằng giữa chất lượng Metadata (Tầng 1) và khả năng mở rộng tự động (Tầng 2 theo best practice CocoIndex).
+
+---
+
+## Bài Toán 2: Chiến Lược Retrieval — Top-K, Score Threshold, Hybrid
+
+### So sánh các chiến lược
+
+| Chiến lược | Ưu điểm | Nhược điểm | Phù hợp khi nào |
+|-----------|---------|-----------|----------------|
+| **Top-K cố định** | Đơn giản, luôn có kết quả | Có thể lấy noise nếu K lớn | Query đơn giản, chất lượng embedding tốt |
+| **Score Threshold** | Loại noise hiệu quả | Có thể trả về rỗng nếu query lệch | Khi cần độ chính xác cao |
+| **Top-K + Threshold** | Tốt nhất cả hai | Cần tune 2 tham số | **Phù hợp với hệ thống hiện tại** ✅ |
+| **Hybrid Dense + Sparse/BM25** | Bắt được cả semantic và exact keyword | Phức tạp, thêm dependency | Khi cần tìm tên hàm/API chính xác |
+| **Re-ranking (Cross-Encoder)** | Cải thiện thứ tự đáng kể | Tăng latency, tốn tài nguyên | Production có nhiều users |
+
+### Giải pháp được chọn cho Phase 2.2: **3-Layer Retrieval**
+
+Thay vì chỉ dùng Over-fetch + Threshold, hệ thống sẽ áp dụng pipeline 3 tầng:
+
+```
+[User Query]
+     ↓ Tầng 1: Query Expansion (LLM tạo 2-3 biến thể)
+     ↓ Tầng 2: Vector Search — Over-fetch (top_k × 2) + Threshold Filter
+     ↓ Tầng 3: Context Enrichment (fetch parent/sibling qua PUID graph)
+     ↓ [Final Context → LLM]
+```
+
+| Tầng | Kỹ thuật | Lợi ích | Latency tăng thêm |
+|------|----------|---------|-------------------|
+| 1 | **Query Expansion** | Bắt được câu hỏi tiếng Việt/mơ hồ, tỏ ra nhiều hướng tìm kiếm hơn | +1-3 giây (1 LLM call nhỏ) |
+| 2 | **Over-fetch + Threshold** | Loại noise, giữ chất lượng | ~0 (chỉ filter trong memory) |
+| 3 | **Context Enrichment** | LLM hiểu được bức tranh toàn cảnh (class context) | +50ms (1 SQL query nhỏ) |
+
+> [!IMPORTANT]
+> **Ngưỡng khuyến nghị:** Cosine Similarity >= 0.4 là điểm khởi đầu tốt với model `all-mpnet-base-v2`. Cần theo dõi thực tế và điều chỉnh qua UI slider.
+
+### Roadmap tương lai (Phase 3+)
+- **Hybrid Dense + BM25:** Thêm PostgreSQL Full-Text Search, dùng RRF để merge với vector search. Bắt được tên hàm/class chính xác.
+- **Re-ranking (Cross-Encoder):** Sau khi Over-fetch, dùng model thứ hai để sắp xếp lại thứ tự đúng hơn. Tăng latency ~2-5 giây nhưng precision cao hơn đáng kể.
+- **Full Multi-hop Retrieval:** Sau mỗi vòng retrieve, dùng LLM để lý luận và tạo query mới cho vòng tiếp theo. Phù hợp với câu hỏi phức tạp cần hiểu luồng chạy toàn hệ thống.
+
+---
+
+## Bài Toán 3: Sự Không Nhất Quán về Điểm Số (Score Discrepancy)
+
+### Phân tích
+
+| Nguồn | Giá trị | Loại |
+|-------|---------|------|
+| Log (`indexer_flow.py`) | `0.6209` | Cosine **Similarity** (`1.0 - distance`) |
+| UI (`app.py`) | `0.379` | Cosine **Distance** (raw `<=>` operator) |
+
+`0.6209 + 0.379 = 1.0` — xác nhận đây là cùng một phép đo nhưng biểu diễn khác nhau.
+
+> [!NOTE]
+> Similarity và Distance **không ảnh hưởng đến thứ tự xếp hạng** (Top-K vẫn như nhau). Tuy nhiên chúng ảnh hưởng đến **logic đặt ngưỡng** và **trải nghiệm người dùng**. Cần thống nhất về Similarity (0-1, cao hơn = liên quan hơn) trên toàn hệ thống.
+
+---
+
+## Kế Hoạch Triển Khai Chi Tiết
+
+### Task 1: Nâng cấp `ast_chunker.py` cho Frontend
+
+#### 1.1 Thêm Parser HTML/CSS
+- `[ ]` Load parser HTML từ `tree-sitter-html`: nhận diện `element` nodes, đặc biệt là các thẻ có Angular selector như `app-*`.
+- `[ ]` Load parser CSS từ `tree-sitter-css`: nhận diện `rule_set` (selector + block) làm đơn vị chunk.
+- `[ ]` Thêm alias: `scss` map sang CSS parser (SCSS là superset của CSS, cú pháp cơ bản tương thích).
+
+#### 1.2 Cải thiện Parser TypeScript/JavaScript
+- `[ ]` Thêm vào `target_types["typescript"]`:
+  - `arrow_function` (trong `variable_declarator`: `const fn = () => {}`)
+  - `export_statement` bao bọc `function_declaration` / `class_declaration`
+  - `decorator` (để capture `@Component`, `@Injectable`, `@NgModule`)
+  - `type_alias_declaration` (TypeScript Interfaces/Types)
+- `[ ]` Cải thiện `get_node_name()` để extract tên từ `variable_declarator` (cho arrow functions).
+- `[ ]` Thêm logic đọc Decorator text và prepend vào chunk text để LLM hiểu context Angular.
+- `[ ]` Áp dụng tương tự cho JavaScript parser (`target_types["javascript"]`).
+
+#### 1.3 Cơ chế Universal Fallback (CocoIndex SplitRecursively)
+- `[ ]` Trong `indexer_flow.py`, nếu `lang` không nằm trong danh sách ngôn ngữ có Custom AST Parser (C#, TS, JS, HTML, CSS), chuyển sang gọi **`SplitRecursively`** của CocoIndex với `chunk_size=800`, `chunk_overlap=150`.
+- `[ ]` Kết quả từ `SplitRecursively` sẽ được gán `node_type="file_chunk"`, `node_name="chunk_{index}"` để đảm bảo schema Database vẫn nhất quán (không NULL).
+- `[ ]` Mapping alias đầy đủ: `ts` → `typescript`, `js` → `javascript`, `scss` → `css` (cho Tầng 1 nếu parser có hỗ trợ), các ngôn ngữ còn lại → Tầng 2 SplitRecursively.
+
+> [!NOTE]
+> SplitRecursively vẫn là "hộp đen" — không trả về Metadata phong phú (tên hàm, decorator). Đây là đánh đổi chấp nhận được cho các ngôn ngữ phụ (SCSS, JSON). Ngôn ngữ trọng tâm (C#, TS, HTML, CSS) vẫn dùng Custom AST ở Tầng 1.
+
+**Files cần sửa:** `ast_chunker.py`, `requirements.txt`
+
+---
+
+### Task 2: Nâng cấp Chiến Lược Retrieval trong `indexer_flow.py`
+
+#### 2.1 Over-fetch + Threshold Filtering
+- `[ ]` Thêm hằng số `SIMILARITY_THRESHOLD = 0.40` và `FETCH_MULTIPLIER = 2` vào config section.
+- `[ ]` Sửa SQL query: thay `LIMIT $2` bằng `LIMIT ($2 * $3)` với param thứ 3 là FETCH_MULTIPLIER.
+- `[ ]` Sau khi lấy rows từ DB, filter: giữ lại `row['score'] >= SIMILARITY_THRESHOLD`.
+- `[ ]` Trim xuống `top_k` cuối cùng.
+- `[ ]` Log chi tiết: "Fetched X / After threshold Y / Final Z".
+
+#### 2.2 Thống nhất Cosine Similarity
+- `[ ]` Xác nhận SQL đang dùng `1.0 - (embedding <=> $1) AS score` — đây là Similarity, đúng chuẩn.
+- `[ ]` Thêm docstring/comment rõ ràng: `score` là Cosine Similarity (0-1, cao hơn = liên quan hơn).
+- `[ ]` Thêm Debug log: in ra score min/max của kết quả trả về sau mỗi search.
+
+#### 2.3 Query Expansion (dùng LLM tạo biến thể câu hỏi)
+- `[ ]` Trước khi gọi vector search, gọi LLM (model nhỏ/nhanh) với prompt: *"Tạo 2-3 biến thể tiếng Anh kỹ thuật của câu hỏi sau: {query}"*.
+- `[ ]` Chạy vector search song song cho cả query gốc và tất cả biến thể (async/concurrent).
+- `[ ]` Merge kết quả từ tất cả queries: deduplicate theo `puid`, giữ score cao nhất nếu cùng chunk xuất hiện nhiều lần.
+- `[ ]` Thêm tùy chọn bật/tắt Query Expansion trong Sidebar (mặc định: bật).
+- `[ ]` Log rõ: in ra các biến thỉ được tạo ra để dễ debug.
+
+> [!NOTE]
+> Query Expansion nên dùng model nhỏ và nhanh (như `gemma3:4b` của Ollama hiện tại) thay vì model chính, để giảm thiểu latency. Khi tắt Query Expansion, hệ thống hoạt động như cũ.
+
+#### 2.4 Context Enrichment (dùng PUID graph)
+- `[ ]` Sau khi có danh sách chunk sau Threshold Filter, với mỗi chunk có `parent_puid != NULL`, thực hiện 1 SQL query bổ sung để lấy **nội dung của node cha** (Skeleton của class đó).
+- `[ ]` Append nội dung node cha vào context của LLM (dưới dạng comment "Context from parent class: ...") để LLM hiểu được method đang đứng trong cấu trúc nào.
+- `[ ]` Deduplicate: nếu node cha đã có trong kết quả chính thì không thêm nữa.
+- `[ ]` Giới hạn: chỉ fetch parent của top 3 chunks (tránh context window quá lớn).
+
+> [!TIP]
+> Context Enrichment tận dụng `puid`/`parent_puid` đã có sẵn trong DB, không cần thay đổi infrastructure. Đây là dạng "mini Multi-hop" với chi phí rất thấp.
+
+**Files cần sửa:** `indexer_flow.py`, `rag.py`
+
+---
+
+### Task 3: Nâng cấp UI trong `app.py` và `rag.py`
+
+#### 3.1 Thêm Similarity Threshold Slider
+- `[ ]` Trong Sidebar, thêm section "3. Cài đặt Tìm kiếm":
+  - Slider `similarity_threshold`: range 0.0 → 1.0, mặc định 0.40, step 0.05.
+  - Truyền `similarity_threshold` vào `query_cocoindex_db()`.
+- `[ ]` Cập nhật `rag.py`: hàm `query_cocoindex_db()` nhận thêm parameter `min_score: float = 0.40`.
+
+#### 3.2 Cải thiện hiển thị kết quả
+- `[ ]` Hiển thị màu sắc cho score (dùng HTML/CSS trong `st.markdown`):
+  - `score >= 0.7` → 🟢 xanh lá (High relevance)
+  - `score 0.5-0.7` → 🟡 vàng (Medium relevance)
+  - `score < 0.5` → 🔴 đỏ (Low relevance)
+- `[ ]` Thêm thông báo nếu kết quả bị filter: "X chunks bị loại do score < {threshold}".
+- `[ ]` Hiển thị đường dẫn file rút gọn: bỏ prefix `/tmp/workspace/project_hash/`.
+
+**Files cần sửa:** `app.py`, `rag.py`
+
+---
+
+### Task 4: Cập nhật Pipeline Indexing
+
+#### 4.1 Mở rộng extension được index
+- `[ ]` Trong `indexer_flow.py`, đảm bảo `.html`, `.css`, `.scss`, `.less` được include.
+- `[ ]` Trong `app.py` (UI cài đặt extension), cập nhật giá trị mặc định.
+- `[ ]` Kiểm tra: lang detect cho `.html` → `html`, `.css` → `css` có chính xác không.
+
+#### 4.2 Điều chỉnh Excluded Patterns
+- `[ ]` Thêm vào `EXCLUDED_PATTERNS`: `**/*.min.css`, `**/*.generated.ts`, `**/*.d.ts`.
+
+**Files cần sửa:** `indexer_flow.py`, `app.py`
+
+---
+
+### Task 5: Cập nhật Dependencies
+
+- `[ ]` Thêm vào `requirements.txt`: `tree-sitter-html` và `tree-sitter-css`.
+- `[ ]` Rebuild Docker image.
+
+---
+
+## Thứ Tự Ưu Tiên Triển Khai
+
+```mermaid
+graph TD
+    T5["Task 5: Update requirements.txt"] --> T1["Task 1: Nâng cấp ast_chunker.py"]
+    T1 --> T4["Task 4: Mở rộng pipeline cho HTML/CSS"]
+    T4 --> T2["Task 2: Smart Retrieval - Threshold"]
+    T2 --> T23["Task 2.3: Query Expansion"]
+    T2 --> T24["Task 2.4: Context Enrichment"]
+    T23 --> T3["Task 3: Nâng cấp UI"]
+    T24 --> T3
+```
+
+| Thứ tự | Task | Lý do ưu tiên |
+|--------|------|--------------|
+| 1 | Task 5 — requirements.txt | Bắt buộc trước để có thư viện |
+| 2 | Task 1 — ast_chunker.py | Core của toàn bộ cải tiến indexing |
+| 3 | Task 4 — Pipeline extensions | Đảm bảo HTML/CSS được đưa vào index |
+| 4 | Task 2 — Smart retrieval | Cải thiện chất lượng kết quả trả về |
+| 5 | Task 2.3 — Query Expansion | Tăng khả năng hiểu câu hỏi đa ngôn ngữ/mơ hồ |
+| 6 | Task 2.4 — Context Enrichment | Tăng độ sâu ngữ cảnh cho LLM |
+| 7 | Task 3 — UI | Hoàn thiện trải nghiệm người dùng |
+
+---
+
+## Kế Hoạch Kiểm Tra (Verification Plan)
+
+### Task 5 — Cập nhật Dependencies
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 5.1 | Sau khi rebuild Docker, kiểm tra log khởi động của container `app` | Không có lỗi `ModuleNotFoundError: tree-sitter-html` hoặc `tree-sitter-css` |
+| 5.2 | Kiểm tra danh sách package trong container: `pip list \| grep tree-sitter` | Thấy cả `tree-sitter-html` và `tree-sitter-css` trong danh sách |
+
+---
+
+### Task 1 — Nâng cấp `ast_chunker.py` cho Frontend
+
+#### Task 1.1 — Parser HTML
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 1.1.1 | Index một file `.component.html` của Angular (ví dụ: `asset-list.component.html`) rồi xem log | Log hiển thị nhiều chunk riêng biệt: `element: app-table`, `element: button`, `element: div.container`... Không còn chỉ 1 chunk `file: global` |
+| 1.1.2 | Tìm kiếm "nút bấm submit trong form" trên Angular source | Tìm thấy chunk chứa `<button type="submit">` với node_type là `element`, không phải toàn bộ file HTML |
+| 1.1.3 | Xem kết quả trích dẫn trên UI sau khi tìm kiếm | Cột "node_type" hiển thị `element` và "node_name" hiển thị tên tag/class HTML, không phải `global` |
+
+#### Task 1.2 — Parser CSS/SCSS
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 1.2.1 | Index một file `.component.css` rồi xem log | Log hiển thị nhiều chunk có node_type là `rule_set`, mỗi chunk là một CSS selector block |
+| 1.2.2 | Tìm kiếm "màu nền của header" trên Angular source | Tìm thấy chunk chứa selector CSS liên quan (`header { background: ... }`), không phải toàn bộ file |
+| 1.2.3 | Index file `.scss` rồi xem log | Log không báo lỗi parser, các rule cơ bản của SCSS được chia thành chunk (mixins phức tạp có thể không capture đầy đủ — chấp nhận được) |
+
+#### Task 1.3 — Parser TypeScript/JavaScript (Arrow Functions & Decorators)
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 1.3.1 | Index file service Angular dùng arrow function (ví dụ: `const getAssets = () => ...`) rồi xem log | Log hiển thị chunk riêng cho arrow function với node_name là tên biến (`getAssets`), không bị bỏ qua |
+| 1.3.2 | Index file component Angular có `@Component({ selector: 'app-asset-list' })` | Log hiển thị chunk có decorator text được prepend vào nội dung: text bắt đầu bằng `@Component(...)` |
+| 1.3.3 | Tìm kiếm "component hiển thị danh sách" | Kết quả trả về chunk TypeScript có decorator `@Component` trong phần text |
+| 1.3.4 | Index file TypeScript có `export interface AssetDto { ... }` | Log hiển thị chunk với node_type là `interface` và node_name là `AssetDto` |
+
+#### Task 1.4 — Universal Fallback (SCSS phức tạp, JSON)
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 1.4.1 | Index một file `package.json` hoặc `tsconfig.json` rồi xem log | Log không báo lỗi, file được chia thành chunk với node_type là `file_chunk`, không phải 1 chunk khổng lồ duy nhất |
+| 1.4.2 | Index file SCSS có SCSS-specific syntax (`$variable`, nesting) rồi xem log | File được xử lý qua SplitRecursively, không crash, tạo ra ít nhất 1 chunk |
+
+---
+
+### Task 2 — Nâng cấp Chiến Lược Retrieval
+
+#### Task 2.1 + 2.2 — Over-fetch + Threshold & Score Consistency
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 2.1.1 | Tìm kiếm một câu hỏi bình thường, quan sát log server | Log in ra 3 dòng: "Fetched: 20", "After threshold (0.40): 8", "Final: 10" (hoặc số tương tự) |
+| 2.1.2 | Trên UI, điều chỉnh threshold slider lên 0.8 rồi tìm kiếm cùng câu hỏi | Số lượng "nguồn trích dẫn" hiển thị ít hơn đáng kể so với threshold 0.4 |
+| 2.1.3 | Tìm kiếm rồi so sánh score hiển thị trên UI với score trong log server | Hai giá trị phải **bằng nhau** (ví dụ: UI hiện `0.621`, log ghi `0.621` — không còn 0.621 vs 0.379) |
+| 2.1.4 | Tìm kiếm một chủ đề hoàn toàn không liên quan đến codebase (ví dụ: "công thức nấu phở") | Hệ thống trả về "Không tìm thấy thông tin phù hợp" thay vì trả về code ngẫu nhiên |
+
+#### Task 2.3 — Query Expansion
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 2.3.1 | Tìm kiếm bằng tiếng Việt mơ hồ: *"Tìm hàm thêm tài sản"* | Log server in ra các biến thể được tạo như `["AddAsync asset", "create asset method", "insert asset service"]`. Kết quả trả về bao gồm `AssetService.AddAsync` |
+| 2.3.2 | Tìm kiếm bằng tiếng Anh kỹ thuật chính xác: *"AddAsync method"* (không bật Query Expansion) | Kết quả tương đương hoặc tốt hơn so với khi bật Query Expansion (Query Expansion không làm giảm chất lượng) |
+| 2.3.3 | Tắt Query Expansion trong Sidebar rồi tìm kiếm cùng câu hỏi tiếng Việt mơ hồ ở 2.3.1 | Kết quả ít chính xác hơn hoặc không tìm thấy (xác nhận Query Expansion có đóng góp thực sự) |
+| 2.3.4 | Tìm kiếm với Query Expansion bật, quan sát thời gian phản hồi | Thời gian tổng tăng không quá 3 giây so với tắt Query Expansion |
+
+#### Task 2.4 — Context Enrichment
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 2.4.1 | Tìm kiếm một method cụ thể (ví dụ: `AddAsync`) | Trong kết quả trích dẫn trên UI, ngoài chunk của method `AddAsync`, còn hiển thị thêm chunk Skeleton của class `AssetService` (với nhãn "Context from parent class") |
+| 2.4.2 | Tìm kiếm một hàm không có `parent_puid` (ví dụ: hàm global trong JS) | Không bị lỗi, kết quả bình thường, không có phần "Context from parent class" trong trích dẫn |
+| 2.4.3 | Đặt câu hỏi: *"AssetService có những method nào?"* | LLM trả lời liệt kê được các method từ Skeleton chunk được fetch thêm, không chỉ method được tìm trực tiếp |
+
+---
+
+### Task 3 — Nâng cấp UI
+
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 3.1 | Mở sidebar, kiểm tra mục "3. Cài đặt Tìm kiếm" | Thấy slider "Similarity Threshold" với giá trị mặc định 0.40, có thể kéo từ 0.0 đến 1.0 |
+| 3.2 | Tìm kiếm một câu hỏi có kết quả, quan sát màu sắc score trong phần trích dẫn | Chunk có score >= 0.7 hiển thị icon/màu xanh, 0.5-0.7 màu vàng, dưới 0.5 màu đỏ |
+| 3.3 | Tìm kiếm rồi kiểm tra đường dẫn file hiển thị trong phần trích dẫn | Đường dẫn hiển thị dạng rút gọn (ví dụ: `amo-angular/src/app/asset.service.ts`), **không** hiển thị `/tmp/workspace/amo-angular_xxxxxx/...` |
+| 3.4 | Tìm kiếm với threshold 0.8 khi có nhiều kết quả dưới ngưỡng | Hiển thị thông báo: "X chunks bị loại do score < 0.80" |
+
+---
+
+### Task 4 — Pipeline Extensions
+
+| # | Hành động kiểm tra | Kết quả mong đợi |
+|---|-------------------|-----------------|
+| 4.1 | Index project Angular, quan sát log indexing | Log xác nhận đang xử lý các file `.html`, `.css`, `.scss` (không chỉ `.ts`) |
+| 4.2 | Kiểm tra xem file `.d.ts` có bị bỏ qua không | Log không hiển thị file `.d.ts` (ví dụ: `index.d.ts`) trong danh sách file được index |
+| 4.3 | Kiểm tra xem file `.min.css` có bị bỏ qua không | Log không hiển thị file `.min.css` trong danh sách file được index |
+
+---
+
+### Kiểm Tra Tổng Thể Sau Khi Hoàn Thành Phase 2.2
+
+| # | Kịch bản End-to-End | Kết quả mong đợi |
+|---|---------------------|-----------------|
+| E2E-1 | Chọn Angular source, hỏi: *"Giao diện nào hiển thị danh sách asset?"* | Tìm thấy cả file `.html` (template) và `.ts` (component logic) liên quan |
+| E2E-2 | Chọn C# source, hỏi: *"Hàm nào xử lý việc thêm asset mới?"* | Tìm thấy `AssetService.AddAsync` với đầy đủ context class |
+| E2E-3 | Chọn CẢ HAI sources cùng lúc, hỏi: *"Luồng tạo asset từ UI đến API?"* | LLM tổng hợp được thông tin từ cả Angular component (`.ts`/`.html`) lẫn C# Service (`.cs`) |
+| E2E-4 | Hỏi bằng tiếng Việt: *"Tìm phần CSS định nghĩa màu chủ đạo của giao diện"* | Tìm thấy CSS/SCSS rule liên quan đến primary color/theme |
+| E2E-5 | Chưa chọn source, nhập câu hỏi và gửi | Hệ thống hiển thị cảnh báo "Vui lòng chọn Project trước" thay vì thực hiện query |
+| E2E-6 | Index lại sau khi đã có data cũ (idempotent test) | Không có lỗi "relation already exists", dữ liệu cũ được cập nhật đúng |
+
+
+---
+
+## Ghi Chú Kỹ Thuật
+
+> [!NOTE]
+> **SCSS và `tree-sitter-css`:** SCSS là superset của CSS. Cú pháp cơ bản (selectors, rules) hoàn toàn tương thích. Parser CSS sẽ bỏ qua variables (`$var`), nesting, mixins — nhưng đây là chấp nhận được vì phần quan trọng nhất (selector + properties) vẫn được capture.
+
+> [!TIP]
+> **Về Re-ranking:** Không nên triển khai Re-ranking (Cross-Encoder) trong Phase 2.2 vì nó tăng latency đáng kể. Nên để Phase 3 khi có nhu cầu thực tế.
+
+> [!WARNING]
+> **Reset Index bắt buộc sau Phase 2.2:** Sau khi cải thiện `ast_chunker.py`, mọi file đã index cũ sẽ có cấu trúc chunk khác. Người dùng **bắt buộc phải Reset và Index lại** tất cả các source để có dữ liệu đồng nhất.
