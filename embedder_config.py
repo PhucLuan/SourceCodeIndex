@@ -52,7 +52,7 @@ DEFAULT_PROFILES: Dict[str, EmbedderProfile] = {
         # Nomic yêu cầu instruction prefix để phân biệt document vs query
         document_prefix="search_document: ",
         query_prefix="search_query: ",
-        trust_remote_code=True,
+        trust_remote_code=False,
     ),
     # Chuẩn bị cho Phase 4 khi mở rộng tài liệu Excel, Word, Markdown, v.v.
     # "doc": EmbedderProfile(
