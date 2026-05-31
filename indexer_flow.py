@@ -47,6 +47,7 @@ from cocoindex.resources.id import IdGenerator
 from sentence_transformers import SentenceTransformer
 
 from ast_chunker import extract_ast_nodes
+from graph_edge_extractor import extract_graph_edges
 from graph_node_contract import canonicalize_node_kind
 
 
@@ -278,6 +279,92 @@ def _build_file_chunk(filepath: pathlib.PurePath, text: str, lang: str):
     )
 
 
+def get_graph_edge_table_name(table_name: str) -> str:
+    return f"{table_name}_graph_edges"
+
+
+async def persist_graph_edges(edges: list, table_name: str) -> None:
+    if not edges:
+        return
+
+    rows = [
+        (
+            edge.id,
+            sanitize_for_pg(edge.repo_name),
+            sanitize_for_pg(edge.filename),
+            sanitize_for_pg(edge.lang),
+            sanitize_for_pg(edge.edge_type),
+            sanitize_for_pg(edge.resolution_status),
+            float(edge.confidence),
+            sanitize_for_pg(edge.source_puid),
+            sanitize_for_pg(edge.target_puid),
+            sanitize_for_pg(edge.source_symbol),
+            sanitize_for_pg(edge.target_symbol),
+            int(edge.source_line or 0),
+            int(edge.target_line or 0),
+            sanitize_for_pg(edge.metadata),
+        )
+        for edge in edges
+    ]
+
+    create_sql = f"""
+        CREATE TABLE IF NOT EXISTS "{PG_SCHEMA}"."{table_name}" (
+            id TEXT PRIMARY KEY,
+            repo_name VARCHAR,
+            filename VARCHAR,
+            lang VARCHAR,
+            edge_type VARCHAR,
+            resolution_status VARCHAR,
+            confidence DOUBLE PRECISION,
+            source_puid VARCHAR,
+            target_puid VARCHAR,
+            source_symbol TEXT,
+            target_symbol TEXT,
+            source_line INT,
+            target_line INT,
+            metadata TEXT
+        )
+    """
+    index_sql = [
+        f'CREATE INDEX IF NOT EXISTS idx_{table_name}_source_puid ON "{PG_SCHEMA}"."{table_name}" (source_puid)',
+        f'CREATE INDEX IF NOT EXISTS idx_{table_name}_target_puid ON "{PG_SCHEMA}"."{table_name}" (target_puid)',
+        f'CREATE INDEX IF NOT EXISTS idx_{table_name}_edge_type ON "{PG_SCHEMA}"."{table_name}" (edge_type)',
+        f'CREATE INDEX IF NOT EXISTS idx_{table_name}_repo_name ON "{PG_SCHEMA}"."{table_name}" (repo_name)',
+    ]
+
+    insert_sql = f"""
+        INSERT INTO "{PG_SCHEMA}"."{table_name}" (
+            id, repo_name, filename, lang, edge_type, resolution_status, confidence,
+            source_puid, target_puid, source_symbol, target_symbol, source_line, target_line, metadata
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11, $12, $13, $14
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            repo_name = EXCLUDED.repo_name,
+            filename = EXCLUDED.filename,
+            lang = EXCLUDED.lang,
+            edge_type = EXCLUDED.edge_type,
+            resolution_status = EXCLUDED.resolution_status,
+            confidence = EXCLUDED.confidence,
+            source_puid = EXCLUDED.source_puid,
+            target_puid = EXCLUDED.target_puid,
+            source_symbol = EXCLUDED.source_symbol,
+            target_symbol = EXCLUDED.target_symbol,
+            source_line = EXCLUDED.source_line,
+            target_line = EXCLUDED.target_line,
+            metadata = EXCLUDED.metadata
+    """
+
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        async with pool.acquire() as conn:
+            await conn.execute(create_sql)
+            for stmt in index_sql:
+                await conn.execute(stmt)
+            await conn.executemany(insert_sql, rows)
+
+
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @coco.lifespan
@@ -384,6 +471,9 @@ async def process_file(
     file: FileLike,
     table: postgres.TableTarget[CodeEmbedding],
 ) -> None:
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+
     text = await file.read_text()
     filepath = file.file_path.path
     # === [DEBUG_LOG_START] ===
@@ -433,6 +523,17 @@ async def process_file(
         repo_name,
     )
 
+    graph_edges = extract_graph_edges(
+        str(filepath),
+        text,
+        lang,
+        chunks,
+        repo_name,
+        normalize_puid,
+    )
+    edge_table_name = get_graph_edge_table_name(act_prof.table_name)
+    await persist_graph_edges(graph_edges, edge_table_name)
+
 
 @coco.fn
 async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
@@ -459,6 +560,39 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
                     await pool.execute(f'ALTER TABLE "{PG_SCHEMA}"."{act_prof.table_name}" {column_sql}')
         except Exception as e:
             sys.stderr.write(f"[MIGRATION WARNING] Failed to add repo_name column: {e}\n")
+            sys.stderr.flush()
+
+        edge_table_name = get_graph_edge_table_name(act_prof.table_name)
+        try:
+            await pool.execute(
+                f'''
+                CREATE TABLE IF NOT EXISTS "{PG_SCHEMA}"."{edge_table_name}" (
+                    id TEXT PRIMARY KEY,
+                    repo_name VARCHAR,
+                    filename VARCHAR,
+                    lang VARCHAR,
+                    edge_type VARCHAR,
+                    resolution_status VARCHAR,
+                    confidence DOUBLE PRECISION,
+                    source_puid VARCHAR,
+                    target_puid VARCHAR,
+                    source_symbol TEXT,
+                    target_symbol TEXT,
+                    source_line INT,
+                    target_line INT,
+                    metadata TEXT
+                )
+                '''
+            )
+            for stmt in [
+                f'CREATE INDEX IF NOT EXISTS idx_{edge_table_name}_source_puid ON "{PG_SCHEMA}"."{edge_table_name}" (source_puid)',
+                f'CREATE INDEX IF NOT EXISTS idx_{edge_table_name}_target_puid ON "{PG_SCHEMA}"."{edge_table_name}" (target_puid)',
+                f'CREATE INDEX IF NOT EXISTS idx_{edge_table_name}_edge_type ON "{PG_SCHEMA}"."{edge_table_name}" (edge_type)',
+                f'CREATE INDEX IF NOT EXISTS idx_{edge_table_name}_repo_name ON "{PG_SCHEMA}"."{edge_table_name}" (repo_name)',
+            ]:
+                await pool.execute(stmt)
+        except Exception as e:
+            sys.stderr.write(f"[MIGRATION WARNING] Failed to create edge table: {e}\n")
             sys.stderr.flush()
 
     table_schema = await postgres.TableSchema.from_class(
@@ -734,6 +868,57 @@ def fetch_nodes(
         asyncio.set_event_loop(loop)
         
     return loop.run_until_complete(fetch_nodes_by_puid(puids, is_skeleton))
+
+
+async def fetch_edges_by_puid_async(
+    puids: List[str],
+    direction: str = "both",
+) -> list[dict]:
+    """Fetch graph edges touching the given PUIDs."""
+    if not puids:
+        return []
+
+    from embedder_config import load_active_profile
+    act_prof = load_active_profile()
+    edge_table_name = get_graph_edge_table_name(act_prof.table_name)
+
+    direction = (direction or "both").lower()
+    if direction == "incoming":
+        clause = "target_puid = ANY($1)"
+    elif direction == "outgoing":
+        clause = "source_puid = ANY($1)"
+    else:
+        clause = "(source_puid = ANY($1) OR target_puid = ANY($1))"
+
+    query = f"""
+        SELECT id, repo_name, filename, lang, edge_type, resolution_status, confidence,
+               source_puid, target_puid, source_symbol, target_symbol, source_line, target_line, metadata
+        FROM "{PG_SCHEMA}"."{edge_table_name}"
+        WHERE {clause}
+        ORDER BY edge_type, source_puid, target_puid, source_line
+    """
+
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, puids)
+
+    return [dict(r) for r in rows]
+
+
+def fetch_edges_by_puid(
+    puids: List[str],
+    direction: str = "both",
+) -> list[dict]:
+    """Sync wrapper for edge lookups."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(fetch_edges_by_puid_async(puids, direction))
 
 
 def search(
