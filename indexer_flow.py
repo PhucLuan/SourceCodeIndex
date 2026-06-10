@@ -635,8 +635,20 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
             
         try:
             await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_text_search ON "{PG_SCHEMA}"."{act_prof.table_name}" USING GIN (text_search)')
+            # Symbol Indexes (Task 3.1)
+            await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_{act_prof.table_name}_node_name ON "{PG_SCHEMA}"."{act_prof.table_name}" (node_name)')
+            await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_{act_prof.table_name}_qualified_name ON "{PG_SCHEMA}"."{act_prof.table_name}" (qualified_name)')
+            await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_{act_prof.table_name}_filename ON "{PG_SCHEMA}"."{act_prof.table_name}" (filename)')
+            await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_{act_prof.table_name}_export_status ON "{PG_SCHEMA}"."{act_prof.table_name}" (export_status)')
+            await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_{act_prof.table_name}_lang ON "{PG_SCHEMA}"."{act_prof.table_name}" (lang)')
+            
+            # pg_trgm for fuzzy search on symbol name & qualified name
+            await pool.execute('CREATE EXTENSION IF NOT EXISTS pg_trgm')
+            await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_{act_prof.table_name}_node_name_trgm ON "{PG_SCHEMA}"."{act_prof.table_name}" USING gin (node_name gin_trgm_ops)')
+            await pool.execute(f'CREATE INDEX IF NOT EXISTS idx_{act_prof.table_name}_qualified_name_trgm ON "{PG_SCHEMA}"."{act_prof.table_name}" USING gin (qualified_name gin_trgm_ops)')
         except Exception as e:
-            sys.stderr.write(f"[MIGRATION ERROR] Failed to create index: {e}\n")
+            sys.stderr.write(f"[MIGRATION ERROR] Failed to create symbol indexes: {e}\n")
+
 
     # Walk toàn bộ thư mục workspace — recursive=True đảm bảo lấy hết thư mục con
     files = localfs.walk_dir(
@@ -656,6 +668,20 @@ async def app_main(sourcedir: pathlib.Path, **kwargs) -> None:
     sys.stderr.flush()
     # === [DEBUG_LOG_END] ===
     await coco.mount_each(process_file, file_list, target_table)
+
+    # === [LINKER_START] ===
+    try:
+        from graph_symbol_linker import resolve_unresolved_edges
+        sys.stderr.write("[INDEX] Starting cross-file symbol linker...\n")
+        sys.stderr.flush()
+        linker_res = await resolve_unresolved_edges()
+        sys.stderr.write(f"[INDEX] Symbol linker completed. Resolved {linker_res.get('updated', 0)} edges.\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[INDEX ERROR] Symbol linker failed: {e}\n")
+        sys.stderr.flush()
+    # === [LINKER_END] ===
+
 
 
 # ─── App entry point ──────────────────────────────────────────────────────────

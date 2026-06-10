@@ -9,6 +9,7 @@ Cải tiến:
 import os
 import time
 import sys
+from typing import Optional, List, Dict
 from langchain_core.documents import Document
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import PromptTemplate
@@ -449,3 +450,159 @@ Phân tích và trả lời bằng tiếng Việt hoặc tiếng Anh:"""
             yield chunk.content
         else:
             yield str(chunk)
+
+
+# ─── Graph Query Helpers ──────────────────────────────────────────────────────
+
+import asyncpg
+from indexer_flow import DATABASE_URL, PG_SCHEMA, get_graph_edge_table_name, TABLE_NAME
+
+async def get_neighbors(puid: str) -> list[dict]:
+    """Get all neighbor nodes (both incoming and outgoing edges) with their metadata."""
+    edge_table = get_graph_edge_table_name(TABLE_NAME)
+    query = f"""
+        SELECT e.edge_type, e.resolution_status, e.confidence, e.source_puid, e.target_puid, 
+               e.source_symbol, e.target_symbol, e.source_line, e.target_line,
+               n.filename, n.node_type, n.node_name, n.text
+        FROM "{PG_SCHEMA}"."{edge_table}" e
+        LEFT JOIN "{PG_SCHEMA}"."{TABLE_NAME}" n 
+          ON (e.target_puid = n.puid AND e.source_puid = $1)
+          OR (e.source_puid = n.puid AND e.target_puid = $1)
+        WHERE e.source_puid = $1 OR e.target_puid = $1
+    """
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        rows = await pool.fetch(query, puid)
+        return [dict(r) for r in rows]
+
+async def get_incoming_edges(puid: str) -> list[dict]:
+    edge_table = get_graph_edge_table_name(TABLE_NAME)
+    query = f"""
+        SELECT e.edge_type, e.resolution_status, e.confidence, e.source_puid, e.target_puid, 
+               e.source_symbol, e.target_symbol, e.source_line, e.target_line,
+               n.filename, n.node_type, n.node_name, n.text
+        FROM "{PG_SCHEMA}"."{edge_table}" e
+        LEFT JOIN "{PG_SCHEMA}"."{TABLE_NAME}" n ON e.source_puid = n.puid
+        WHERE e.target_puid = $1
+    """
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        rows = await pool.fetch(query, puid)
+        return [dict(r) for r in rows]
+
+async def get_outgoing_edges(puid: str) -> list[dict]:
+    edge_table = get_graph_edge_table_name(TABLE_NAME)
+    query = f"""
+        SELECT e.edge_type, e.resolution_status, e.confidence, e.source_puid, e.target_puid, 
+               e.source_symbol, e.target_symbol, e.source_line, e.target_line,
+               n.filename, n.node_type, n.node_name, n.text
+        FROM "{PG_SCHEMA}"."{edge_table}" e
+        LEFT JOIN "{PG_SCHEMA}"."{TABLE_NAME}" n ON e.target_puid = n.puid
+        WHERE e.source_puid = $1
+    """
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        rows = await pool.fetch(query, puid)
+        return [dict(r) for r in rows]
+
+async def get_shortest_path(start_puid: str, end_puid: str, max_depth: int = 5) -> list[dict]:
+    """Find the shortest path between two nodes in the graph using BFS in SQL/Python."""
+    edge_table = get_graph_edge_table_name(TABLE_NAME)
+    query = f"""
+        SELECT source_puid, target_puid, edge_type, resolution_status 
+        FROM "{PG_SCHEMA}"."{edge_table}" 
+        WHERE resolution_status = 'resolved'
+    """
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        rows = await pool.fetch(query)
+        edges = [dict(r) for r in rows]
+        
+    adj: dict[str, list[dict]] = {}
+    for edge in edges:
+        src = edge["source_puid"]
+        adj.setdefault(src, []).append(edge)
+        
+    from collections import deque
+    queue = deque([[start_puid]])
+    visited = {start_puid}
+    
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+        if node == end_puid:
+            result_path = []
+            for i in range(len(path) - 1):
+                u = path[i]
+                v = path[i+1]
+                matching_edges = [e for e in adj.get(u, []) if e["target_puid"] == v]
+                edge_type = matching_edges[0]["edge_type"] if matching_edges else "depends_on"
+                result_path.append({"source": u, "target": v, "edge_type": edge_type})
+            return result_path
+            
+        if len(path) > max_depth:
+            continue
+            
+        for edge in adj.get(node, []):
+            nxt = edge["target_puid"]
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append(path + [nxt])
+                
+    return []
+
+
+async def lookup_symbol(name: str, repo_name: Optional[str] = None, fuzzy: bool = False) -> list[dict]:
+    """
+    Search for a symbol in the nodes table.
+    Uses B-tree / trigram indexes created by the indexer for exact or fuzzy match.
+    """
+    params: list[object] = [name]
+    clauses = ["is_skeleton = FALSE"]
+
+    if fuzzy:
+        # Use pure SQL heuristics so fuzzy lookup works even when pg_trgm is unavailable.
+        params.append(f"%{name.lower()}%")
+        clauses.append(
+            "(LOWER(COALESCE(node_name, '')) LIKE $2 OR LOWER(COALESCE(qualified_name, '')) LIKE $2 OR LOWER(COALESCE(filename, '')) LIKE $2)"
+        )
+        if repo_name:
+            params.append(repo_name)
+            clauses.append(f"repo_name = ${len(params)}")
+        query = f"""
+            SELECT
+                puid, filename, repo_name, node_type, node_name, qualified_name,
+                signature, docstring, modifiers, export_status, lang,
+                CASE
+                    WHEN LOWER(COALESCE(node_name, '')) = LOWER($1) THEN 1.0
+                    WHEN LOWER(COALESCE(qualified_name, '')) = LOWER($1) THEN 0.98
+                    WHEN LOWER(COALESCE(node_name, '')) LIKE LOWER($2) THEN 0.85
+                    WHEN LOWER(COALESCE(qualified_name, '')) LIKE LOWER($2) THEN 0.8
+                    WHEN LOWER(COALESCE(filename, '')) LIKE LOWER($2) THEN 0.75
+                    WHEN POSITION(LOWER($1) IN LOWER(COALESCE(node_name, ''))) > 0 THEN 0.7
+                    WHEN POSITION(LOWER($1) IN LOWER(COALESCE(qualified_name, ''))) > 0 THEN 0.65
+                    WHEN POSITION(LOWER($1) IN LOWER(COALESCE(filename, ''))) > 0 THEN 0.6
+                    ELSE 0.5
+                END AS score
+            FROM "{PG_SCHEMA}"."{TABLE_NAME}"
+            WHERE {" AND ".join(clauses)}
+            ORDER BY score DESC, node_name ASC, qualified_name ASC
+            LIMIT 10
+        """
+    else:
+        if repo_name:
+            params.append(repo_name)
+            clauses.append(f"repo_name = ${len(params)}")
+        clauses.append("(node_name = $1 OR qualified_name = $1 OR filename = $1)")
+        query = f"""
+            SELECT
+                puid, filename, repo_name, node_type, node_name, qualified_name,
+                signature, docstring, modifiers, export_status, lang,
+                1.0 AS score
+            FROM "{PG_SCHEMA}"."{TABLE_NAME}"
+            WHERE {" AND ".join(clauses)}
+            ORDER BY node_type ASC, node_name ASC, qualified_name ASC
+            LIMIT 10
+        """
+
+    async with await asyncpg.create_pool(DATABASE_URL) as pool:
+        rows = await pool.fetch(query, *params)
+        return [dict(r) for r in rows]
+
+
