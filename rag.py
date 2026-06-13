@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 import time
@@ -28,6 +27,7 @@ from indexer_flow import (
     search as _search,
     search_per_repo,
 )
+from graph_traversal import impact_puids_to_nodes, run_impact_bfs
 
 
 SCORE_THRESHOLD = 0.3
@@ -38,6 +38,7 @@ GRAPH_INTENT_EDGE_MAP: dict[str, set[str]] = {
     "symbol lookup": {"contains", "exports"},
     "dependency": {"imports", "exports", "depends_on", "contains"},
     "call flow": {"calls", "contains"},
+    "call_flow_reverse": {"calls", "contains"},
     "impact analysis": {"calls", "imports", "inherits", "implements", "contains", "depends_on"},
     "architecture tour": {"contains", "imports", "calls", "inherits", "implements", "depends_on"},
     "domain/business flow": {"calls", "imports", "contains", "depends_on"},
@@ -46,6 +47,79 @@ GRAPH_INTENT_EDGE_MAP: dict[str, set[str]] = {
 
 def get_graph_edge_types_for_intent(intent: str) -> set[str]:
     return set(GRAPH_INTENT_EDGE_MAP.get(intent, GRAPH_INTENT_EDGE_MAP["semantic"]))
+
+
+# Slash command definitions
+SLASH_COMMANDS = {
+    "/impact": "impact_analysis",   # F3
+    "/tour": "architecture_tour",  # F1
+    "/calls": "call_flow",
+    "/callers": "call_flow_reverse",
+    "/deps": "dependency",
+    "/search": "semantic",         # F2 (also default when there is no prefix)
+}
+
+COMMAND_PAYLOAD_TAGS: dict[str, str] = {
+    "impact_analysis": "symbol",
+    "architecture_tour": "module",
+    "call_flow": "symbol",
+    "call_flow_reverse": "symbol",
+    "dependency": "file",
+    "semantic": "query",
+}
+
+
+def parse_slash_command(raw_query: str) -> tuple[str, str]:
+    """
+    Returns (intent, cleaned_query).
+
+    Examples:
+        "/impact validateCredentials"  -> ("impact_analysis", "validateCredentials")
+        "/tour auth"                   -> ("architecture_tour", "auth")
+        "/calls login"                 -> ("call_flow", "login")
+        "/callers validateCredentials" -> ("call_flow_reverse", "validateCredentials")
+        "/deps auth_service.py"        -> ("dependency", "auth_service.py")
+        "/search which parts handle token refresh?" -> ("semantic", "which parts handle token refresh?")
+        "which parts handle token refresh?"         -> ("semantic", "which parts handle token refresh?")
+    """
+    stripped = (raw_query or "").strip()
+    lowered = stripped.lower()
+    for cmd, intent in SLASH_COMMANDS.items():
+        if lowered.startswith(cmd + " ") or lowered == cmd:
+            payload = stripped[len(cmd):].strip()
+            return intent, payload
+    return "semantic", stripped
+
+
+def extract_tagged_payload(raw_payload: str, intent: str | None = None) -> tuple[str, str]:
+    """
+    Returns (payload_type, cleaned_payload).
+
+    Supports explicit tags such as:
+      <symbol>RequestService</symbol>
+      <file>auth_service.py</file>
+      <module>auth</module>
+      <query>which parts handle token refresh?</query>
+
+    If no matching tag exists, returns ("", raw_payload.strip()).
+    """
+    text = (raw_payload or "").strip()
+    if not text:
+        return "", ""
+
+    expected_tag = COMMAND_PAYLOAD_TAGS.get(intent or "", "")
+    tag_names = [expected_tag] if expected_tag else list(dict.fromkeys(COMMAND_PAYLOAD_TAGS.values()))
+    for tag_name in tag_names:
+        pattern = rf"^\s*<{tag_name}>\s*(.*?)\s*</{tag_name}>\s*$"
+        match = re.match(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return tag_name, match.group(1).strip()
+    return "", text
+
+
+def detect_query_intent(query_text: str) -> str:
+    """Deprecated compatibility shim; prefer parse_slash_command()."""
+    return parse_slash_command(query_text)[0]
 
 
 def get_reranker_model():
@@ -66,7 +140,7 @@ def rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]:
         return []
 
     model = get_reranker_model()
-    pairs = [(query, c["text"]) for c in candidates]
+    pairs = [(query, c.get("text") or c.get("page_content") or "") for c in candidates]
     start_time = time.perf_counter()
     scores = model.predict(pairs)
     duration = time.perf_counter() - start_time
@@ -101,24 +175,103 @@ Question: {query_text}"""
         return [query_text]
 
 
-def detect_query_intent(query_text: str) -> str:
-    text = (query_text or "").strip().lower()
+def _clean_symbol_token(value: str) -> str:
+    return (value or "").strip().strip("`'\".,;:()[]{}?!")
+
+
+def extract_symbol_from_query(query_text: str) -> str:
+    """Best-effort symbol extraction for graph/symbol-directed queries."""
+    text = (query_text or "").strip()
     if not text:
-        return "semantic"
+        return ""
 
-    rules = [
-        ("impact analysis", [r"\b(anh huong|impact|affected|neu .* sua|doi .* thi ai bi)\b", r"\breverse dependency\b"]),
-        ("call flow", [r"\b(goi\s+.*\bham nao\b|goi gi|goi ham nao|call flow|ai goi|ham nay goi)\b"]),
-        ("dependency", [r"\b(import|phu thuoc|depends on|module nao import|file nao import)\b"]),
-        ("symbol lookup", [r"\b(o dau|tim .*|where is|symbol lookup|ten gan giong|fuzzy)\b"]),
-        ("architecture tour", [r"\b(tour|huong dan doc|bat dau tu dau|architecture|structure)\b"]),
-        ("domain/business flow", [r"\b(ui toi api|ui toi db|luong xu ly|business flow|request flow)\b", r"\b(login|auth)\b"]),
+    symbol = r"([A-Za-z_$][\w.$<>]*)"
+    patterns = [
+        rf"\bwhere\s+(?:is|are)\s+(?:the\s+)?calls?\s+(?:to\s+)?{symbol}\b",
+        rf"\bwhere\s+(?:is|are)\s+{symbol}\s+called\b",
+        rf"\bwho\s+calls\s+{symbol}\b",
+        rf"\bcallers?\s+of\s+{symbol}\b",
+        rf"\bai\s+goi\s+{symbol}\b",
+        rf"\b(?:ham|function|method|class|symbol)\s+{symbol}\s+(?:o dau|where)\b",
+        rf"\bwhere\s+is\s+{symbol}\b",
+        rf"\btim\s+{symbol}\b",
     ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return _clean_symbol_token(match.group(1))
+    return ""
 
-    for intent, patterns in rules:
-        if any(re.search(pattern, text) for pattern in patterns):
-            return intent
-    return "semantic"
+
+def _detect_call_query_direction(intent: str) -> str:
+    if intent == "call_flow_reverse":
+        return "incoming"
+    return "outgoing"
+
+
+def fetch_call_edges_by_symbol(
+    symbol: str,
+    repo_name: Optional[str] = None,
+    direction: str = "incoming",
+    limit: int = 20,
+) -> list[dict]:
+    symbol = _clean_symbol_token(symbol)
+    if not symbol:
+        return []
+
+    direction = (direction or "incoming").lower()
+    symbol_column = "target_symbol" if direction == "incoming" else "source_symbol"
+    puid_column = "target_puid" if direction == "incoming" else "source_puid"
+    params: list[object] = [symbol, f"%{symbol.lower()}%", max(int(limit or 20), 1)]
+    clauses = [
+        "edge_type = 'calls'",
+        f"""(
+            LOWER(COALESCE({symbol_column}, '')) = LOWER($1)
+            OR LOWER(COALESCE({symbol_column}, '')) LIKE $2
+            OR LOWER(COALESCE({puid_column}, '')) LIKE $2
+        )""",
+    ]
+    if repo_name:
+        params.append(repo_name)
+        clauses.append(f"repo_name = ${len(params)}")
+
+    edge_table_name = get_graph_edge_table_name(TABLE_NAME)
+    query = f"""
+        SELECT id, repo_name, filename, lang, edge_type, resolution_status, confidence,
+               source_puid, target_puid, source_symbol, target_symbol, source_line, target_line, metadata
+        FROM "{PG_SCHEMA}"."{edge_table_name}"
+        WHERE {" AND ".join(clauses)}
+        ORDER BY
+            CASE
+                WHEN LOWER(COALESCE({symbol_column}, '')) = LOWER($1) THEN 0
+                WHEN LOWER(COALESCE({symbol_column}, '')) LIKE $2 THEN 1
+                ELSE 2
+            END,
+            confidence DESC,
+            source_line ASC
+        LIMIT $3
+    """
+
+    async def _run() -> list[dict]:
+        async with await asyncpg.create_pool(DATABASE_URL) as pool:
+            rows = await pool.fetch(query, *params)
+            return [dict(r) for r in rows]
+
+    try:
+        import asyncio
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop.run_until_complete(_run())
+    except Exception as ex:
+        sys.stderr.write(f"[WARN] fetch_call_edges_by_symbol failed for '{symbol}': {ex}\n")
+        return []
 
 
 def lookup_symbol(name: str, repo_name: Optional[str] = None, fuzzy: bool = False) -> list[dict]:
@@ -126,28 +279,29 @@ def lookup_symbol(name: str, repo_name: Optional[str] = None, fuzzy: bool = Fals
     clauses = ["is_skeleton = FALSE"]
 
     if fuzzy:
-        params.append(f"%{name.lower()}%")
+        params.append(name)
         clauses.append(
-            "(LOWER(COALESCE(node_name, '')) LIKE $2 OR LOWER(COALESCE(qualified_name, '')) LIKE $2 OR LOWER(COALESCE(filename, '')) LIKE $2)"
+            "(COALESCE(node_name, '') % $2 OR COALESCE(qualified_name, '') % $2 OR COALESCE(filename, '') % $2)"
         )
         if repo_name:
             params.append(repo_name)
             clauses.append(f"repo_name = ${len(params)}")
         query = f"""
-            SELECT puid, filename, repo_name, node_type, node_name, qualified_name,
+            SELECT puid, filename, repo_name, node_type, node_name, qualified_name, text,
                    signature, docstring, modifiers, export_status, lang,
                    CASE
                        WHEN LOWER(COALESCE(node_name, '')) = LOWER($1) THEN 1.0
                        WHEN LOWER(COALESCE(qualified_name, '')) = LOWER($1) THEN 0.98
-                       WHEN LOWER(COALESCE(node_name, '')) LIKE LOWER($2) THEN 0.85
-                       WHEN LOWER(COALESCE(qualified_name, '')) LIKE LOWER($2) THEN 0.8
-                       WHEN LOWER(COALESCE(filename, '')) LIKE LOWER($2) THEN 0.75
-                       ELSE 0.5
+                       ELSE GREATEST(
+                           similarity(COALESCE(node_name, ''), $2),
+                           similarity(COALESCE(qualified_name, ''), $2),
+                           similarity(COALESCE(filename, ''), $2)
+                       )
                    END AS score
             FROM "{PG_SCHEMA}"."{TABLE_NAME}"
             WHERE {" AND ".join(clauses)}
             ORDER BY score DESC, node_name ASC, qualified_name ASC
-            LIMIT 10
+            LIMIT 15
         """
     else:
         if repo_name:
@@ -155,7 +309,7 @@ def lookup_symbol(name: str, repo_name: Optional[str] = None, fuzzy: bool = Fals
             clauses.append(f"repo_name = ${len(params)}")
         clauses.append("(node_name = $1 OR qualified_name = $1 OR filename = $1)")
         query = f"""
-            SELECT puid, filename, repo_name, node_type, node_name, qualified_name,
+            SELECT puid, filename, repo_name, node_type, node_name, qualified_name, text,
                    signature, docstring, modifiers, export_status, lang,
                    1.0 AS score
             FROM "{PG_SCHEMA}"."{TABLE_NAME}"
@@ -169,14 +323,34 @@ def lookup_symbol(name: str, repo_name: Optional[str] = None, fuzzy: bool = Fals
             rows = await pool.fetch(query, *params)
             return [dict(r) for r in rows]
 
-    try:
+    def _safe_run():
         import asyncio
+        import threading
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
 
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(_run())
-    except Exception:
+        if loop.is_running():
+            result = []
+            def thread_target():
+                new_loop = asyncio.new_event_loop()
+                result.extend(new_loop.run_until_complete(_run()))
+                new_loop.close()
+            t = threading.Thread(target=thread_target)
+            t.start()
+            t.join()
+            return result
+        else:
+            return loop.run_until_complete(_run())
+
+    try:
+        return _safe_run()
+    except Exception as ex:
+        import sys
+        sys.stderr.write(f"[WARN] lookup_symbol failed: {ex}\n")
         return []
-
 
 def _enforce_soft_quota(merged: list[dict], top_k: int, max_per_repo: int) -> list[dict]:
     repo_counts: dict[str, int] = {}
@@ -205,9 +379,14 @@ def _graph_edges_to_prompt_block(edges: list[dict[str, Any]]) -> str:
     for edge in edges[:40]:
         src = edge.get("source_node") or edge.get("source_symbol") or edge.get("source_puid") or ""
         tgt = edge.get("target_node") or edge.get("target_symbol") or edge.get("target_puid") or ""
+        location = ""
+        filename = edge.get("filename") or ""
+        line = edge.get("source_line") or edge.get("target_line") or ""
+        if filename and line:
+            location = f", at={filename}:L{line}"
         lines.append(
             f"- {src} -> {tgt} "
-            f"[type={edge.get('edge_type','')}, status={edge.get('resolution_status','')}, confidence={float(edge.get('confidence',0.0)):.2f}]"
+            f"[type={edge.get('edge_type','')}, status={edge.get('resolution_status','')}, confidence={float(edge.get('confidence',0.0)):.2f}{location}]"
         )
     return "\n".join(lines)
 
@@ -235,6 +414,39 @@ def build_answer_payload(query_text: str, docs: list[Document]) -> dict[str, str
     """Build prompt payload for tests and prompt assembly."""
     context_parts: list[str] = []
     graph_edges: list[dict[str, Any]] = list(getattr(st.session_state, "graph_seed_edges", []))
+    intent, payload = parse_slash_command(query_text)
+    payload_type, cleaned_payload = extract_tagged_payload(payload, intent=intent)
+
+    if intent == "impact_analysis":
+        impact = getattr(st.session_state, "impact_result", None)
+        if impact:
+            lines = [f"[IMPACT ANALYSIS] Changed: {cleaned_payload or payload or query_text}"]
+            lines.append(
+                f"Total affected nodes: {impact.get('total_count', 0)}"
+                + (" (max depth reached)" if impact.get("max_depth_reached") else "")
+            )
+            for node in impact.get("affected_nodes", [])[:20]:
+                indent = "  " * int(node.get("depth", 0))
+                lines.append(
+                    f"{indent}depth={node.get('depth', 0)} "
+                    f"[{node.get('via_edge_type', '')}] {node.get('node_name', '')} — {node.get('filename', '')}"
+                )
+            impact_edges = [
+                {
+                    "source_puid": src,
+                    "target_puid": tgt,
+                    "edge_type": edge_type,
+                    "resolution_status": "resolved",
+                }
+                for src, tgt, edge_type, _depth in impact.get("edges", [])
+            ]
+            graph_edges = impact_edges + graph_edges
+            return {
+                "context": "\n\n".join(context_parts),
+                "graph_evidence": "\n".join(lines) + "\n" + _graph_edges_to_prompt_block(graph_edges),
+                "mermaid_graph": _format_mermaid_from_edges(graph_edges),
+                "intent": intent,
+            }
 
     for d in docs:
         meta = d.metadata
@@ -278,10 +490,47 @@ def build_answer_payload(query_text: str, docs: list[Document]) -> dict[str, str
 
     return {
         "context": "\n\n".join(context_parts),
-        "graph_evidence": f"Intent: {detect_query_intent(query_text)}\n" + _graph_edges_to_prompt_block(graph_edges),
+        "graph_evidence": (
+            f"Intent: {intent}\n"
+            f"Payload type: {payload_type or 'raw'}\n"
+            f"Payload: {cleaned_payload}\n"
+            + _graph_edges_to_prompt_block(graph_edges)
+        ),
         "mermaid_graph": _format_mermaid_from_edges(graph_edges),
-        "intent": detect_query_intent(query_text),
+        "intent": intent,
     }
+
+
+def _collect_semantic_graph_context(seed_results: list[dict], repo_names: list[str], limit: int = 5) -> list[dict[str, Any]]:
+    seed_puids = [r.get("puid") for r in seed_results[:limit] if r.get("puid")]
+    if not seed_puids:
+        return []
+
+    graph_edges: list[dict[str, Any]] = []
+    try:
+        graph_edges.extend(fetch_edges_by_puid(seed_puids, direction="both"))
+    except Exception as ex:
+        sys.stderr.write(f"[WARN] semantic graph enrichment failed: {ex}\n")
+        return []
+
+    filtered: list[dict[str, Any]] = []
+    seen_edge_ids: set[str] = set()
+    for edge in graph_edges:
+        if edge.get("edge_type") not in {"contains", "imports"}:
+            continue
+        edge_id = edge.get("id") or "|".join(
+            [
+                edge.get("source_puid", ""),
+                edge.get("target_puid", ""),
+                edge.get("edge_type", ""),
+                str(edge.get("source_line", "")),
+                str(edge.get("target_line", "")),
+            ]
+        )
+        if edge_id and edge_id not in seen_edge_ids:
+            filtered.append(edge)
+            seen_edge_ids.add(edge_id)
+    return filtered[:50]
 
 
 def query_cocoindex_db(
@@ -295,7 +544,8 @@ def query_cocoindex_db(
     use_reranker: bool = False,
 ) -> list[Document]:
     try:
-        intent = detect_query_intent(query_text)
+        intent, raw_payload = parse_slash_command(query_text)
+        payload_type, query_text = extract_tagged_payload(raw_payload, intent=intent)
         graph_edge_types = GRAPH_INTENT_EDGE_MAP.get(intent, GRAPH_INTENT_EDGE_MAP["semantic"])
         queries = expand_query(query_text, llm) if (llm and use_query_expansion) else [query_text]
 
@@ -318,12 +568,75 @@ def query_cocoindex_db(
             f"\n[RETRIEVAL_START] intent={intent} | {len(queries)} queries x {len(repo_names) if use_per_repo else 1} scope(s)\n"
         )
 
-        if intent == "symbol lookup":
+        direct_graph_edges: list[dict[str, Any]] = []
+        if intent in {"call flow", "call_flow_reverse"}:
+            call_symbol = query_text if payload_type == "symbol" and query_text else extract_symbol_from_query(query_text)
+            if not call_symbol:
+                call_symbol = extract_symbol_from_query(raw_payload) or raw_payload.strip()
+            if call_symbol:
+                call_direction = _detect_call_query_direction(intent)
+                for repo in (repo_names or [None]):
+                    direct_graph_edges.extend(
+                        fetch_call_edges_by_symbol(
+                            call_symbol,
+                            repo_name=repo,
+                            direction=call_direction,
+                            limit=search_limit,
+                        )
+                    )
+
+                deduped_edges: list[dict[str, Any]] = []
+                seen_edge_ids: set[str] = set()
+                for edge in direct_graph_edges:
+                    edge_id = edge.get("id") or "|".join(
+                        [
+                            edge.get("source_puid", ""),
+                            edge.get("target_puid", ""),
+                            str(edge.get("source_line", "")),
+                            edge.get("target_symbol", ""),
+                        ]
+                    )
+                    if edge_id and edge_id not in seen_edge_ids:
+                        deduped_edges.append(edge)
+                        seen_edge_ids.add(edge_id)
+                direct_graph_edges = deduped_edges[:search_limit]
+
+                edge_puid_key = "source_puid" if call_direction == "incoming" else "target_puid"
+                direct_puids: list[str] = []
+                for edge in direct_graph_edges:
+                    puid = edge.get(edge_puid_key) or ""
+                    if puid and puid not in direct_puids:
+                        direct_puids.append(puid)
+
+                if direct_puids:
+                    try:
+                        direct_nodes = fetch_nodes(direct_puids)
+                    except Exception as ex:
+                        sys.stderr.write(f"[WARN] fetch_nodes(call graph) failed: {ex}\n")
+                        direct_nodes = []
+                    for node in direct_nodes:
+                        puid = node.get("puid", "")
+                        if puid and puid not in seen_puids:
+                            node["score"] = max(node.get("score", 0.0), 0.95)
+                            node["score_type"] = "graph_callsite"
+                            node["query_intent"] = intent
+                            all_results.append(node)
+                            seen_puids.add(puid)
+
+                if direct_graph_edges:
+                    sys.stderr.write(
+                        f"  - Call graph lookup: symbol='{call_symbol}' direction={call_direction} -> {len(direct_graph_edges)} edge(s).\n"
+                    )
+
+        if all_results:
+            pass
+        elif intent == "symbol lookup":
             symbol_hits: list[dict] = []
+            symbol_query = extract_symbol_from_query(query_text) or query_text
             for repo in (repo_names or [None]):
-                hits = lookup_symbol(query_text, repo_name=repo, fuzzy=False)
+                hits = lookup_symbol(symbol_query, repo_name=repo, fuzzy=False)
                 if not hits:
-                    hits = lookup_symbol(query_text, repo_name=repo, fuzzy=True)
+                    hits = lookup_symbol(symbol_query, repo_name=repo, fuzzy=True)
                 symbol_hits.extend(hits)
             symbol_hits.sort(key=lambda x: x.get("score", 0.0), reverse=True)
             all_results.extend(symbol_hits[:search_limit])
@@ -382,6 +695,16 @@ def query_cocoindex_db(
                         count_valid += 1
                 sys.stderr.write(f"  - Query {idx}: '{q[:50]}' -> {count_valid} new results.\n")
 
+        if intent == "semantic":
+            try:
+                st.session_state.graph_seed_edges = _collect_semantic_graph_context(all_results, repo_names, limit=5)
+            except Exception as ex:
+                sys.stderr.write(f"[WARN] failed to set semantic graph seeds: {ex}\n")
+                try:
+                    st.session_state.graph_seed_edges = []
+                except Exception:
+                    pass
+
         # Graph-aware expansion from seeds.
         seed_puids = [r.get("puid") for r in all_results[: min(len(all_results), top_k)] if r.get("puid")]
         if seed_puids and intent != "symbol lookup":
@@ -392,6 +715,7 @@ def query_cocoindex_db(
                 seed_edges = []
 
             filtered_edges = [e for e in seed_edges if (e.get("edge_type") or "") in graph_edge_types]
+            combined_edges = (direct_graph_edges + filtered_edges)[:50]
             candidate_puids: list[str] = []
             for edge in filtered_edges:
                 for key in ("source_puid", "target_puid"):
@@ -413,7 +737,56 @@ def query_cocoindex_db(
                     seen_puids.add(node.get("puid", ""))
 
             try:
-                st.session_state.graph_seed_edges = filtered_edges[:50]
+                st.session_state.graph_seed_edges = combined_edges
+            except Exception:
+                pass
+        elif direct_graph_edges:
+            try:
+                st.session_state.graph_seed_edges = direct_graph_edges[:50]
+            except Exception:
+                pass
+
+        if intent == "impact_analysis":
+            active_repo = repo_names[0] if repo_names else None
+            seed_nodes = lookup_symbol(query_text, repo_name=active_repo, fuzzy=True)
+            if not seed_nodes and raw_payload != query_text:
+                seed_nodes = lookup_symbol(raw_payload, repo_name=active_repo, fuzzy=True)
+            start_puids = [n.get("puid", "") for n in seed_nodes[:3] if n.get("puid")]
+            start_symbols = [n.get("node_name", "") for n in seed_nodes[:3] if n.get("node_name")]
+            impact_result = run_impact_bfs(start_puids=start_puids, start_symbols=start_symbols, max_depth=3, repo_name=active_repo)
+            try:
+                st.session_state.impact_result = impact_result
+            except Exception:
+                pass
+
+            affected_puids = [r.get("puid", "") for r in impact_result.get("affected_nodes", []) if r.get("puid")]
+            if affected_puids:
+                try:
+                    impacted_nodes = fetch_nodes(affected_puids)
+                except Exception as ex:
+                    sys.stderr.write(f"[WARN] fetch_nodes(impact) failed: {ex}\n")
+                    impacted_nodes = []
+
+                depth_map = {r.get("puid", ""): r.get("depth", 0) for r in impact_result.get("affected_nodes", [])}
+                impacted_nodes.sort(key=lambda x: depth_map.get(x.get("puid", ""), 99))
+                for node in impacted_nodes:
+                    node["score"] = max(node.get("score", 0.0), 0.96)
+                    node["score_type"] = "graph_impact"
+                    node["query_intent"] = intent
+                    if node.get("puid") and node["puid"] not in seen_puids:
+                        all_results.append(node)
+                        seen_puids.add(node["puid"])
+
+            try:
+                st.session_state.graph_seed_edges = [
+                    {
+                        "source_puid": src,
+                        "target_puid": tgt,
+                        "edge_type": edge_type,
+                        "resolution_status": "resolved",
+                    }
+                    for src, tgt, edge_type, _depth in impact_result.get("edges", [])
+                ]
             except Exception:
                 pass
 
@@ -428,7 +801,7 @@ def query_cocoindex_db(
             final_results = rerank(query_text, all_results, top_k)
         else:
             for item in all_results:
-                item["score_type"] = "rrf" if use_hybrid else "cosine"
+                item.setdefault("score_type", "rrf" if use_hybrid else "cosine")
             final_results = all_results[:top_k]
 
         enriched_results = list(final_results)
@@ -445,15 +818,15 @@ def query_cocoindex_db(
 
         return [
             Document(
-                page_content=r["text"],
+                page_content=r.get("text", r.get("page_content", "")),
                 metadata={
-                    "filename": r["filename"],
-                    "lang": r["lang"],
-                    "score": r.get("_rerank_score", r.get("_rrf_score", r["score"])),
+                    "filename": r.get("filename", ""),
+                    "lang": r.get("lang", ""),
+                    "score": r.get("_rerank_score", r.get("_rrf_score", r.get("score", 0.0))),
                     "score_type": r.get("score_type", "cosine_or_rrf"),
-                    "start_line": r["start_line"],
-                    "end_line": r["end_line"],
-                    "is_test": r["is_test"],
+                    "start_line": r.get("start_line", 0),
+                    "end_line": r.get("end_line", 0),
+                    "is_test": r.get("is_test", False),
                     "node_type": r.get("node_type", ""),
                     "node_name": r.get("node_name", ""),
                     "qualified_name": r.get("qualified_name", ""),

@@ -1,4 +1,5 @@
 import sys
+import sys
 import types
 import unittest
 from unittest.mock import patch
@@ -80,17 +81,18 @@ from langchain_core.documents import Document
 
 
 class Phase4IntentTests(unittest.TestCase):
-    def test_detect_query_intent_symbol_lookup(self):
-        self.assertEqual(rag.detect_query_intent("Ham AddAsync o dau?"), "symbol lookup")
+    def test_parse_slash_command_supports_core_modes(self):
+        self.assertEqual(rag.parse_slash_command("/calls Ham nay goi gi?"), ("call_flow", "Ham nay goi gi?"))
+        self.assertEqual(rag.parse_slash_command("/callers RequestService"), ("call_flow_reverse", "RequestService"))
+        self.assertEqual(rag.parse_slash_command("/impact validateCredentials"), ("impact_analysis", "validateCredentials"))
+        self.assertEqual(rag.parse_slash_command("/tour auth"), ("architecture_tour", "auth"))
+        self.assertEqual(rag.parse_slash_command("/deps auth_service.py"), ("dependency", "auth_service.py"))
+        self.assertEqual(rag.parse_slash_command("/search which parts handle token refresh?"), ("semantic", "which parts handle token refresh?"))
 
-    def test_detect_query_intent_call_flow(self):
-        self.assertEqual(rag.detect_query_intent("Ham nay goi gi?"), "call flow")
-
-    def test_detect_query_intent_impact_analysis(self):
-        self.assertEqual(rag.detect_query_intent("Sua file nay anh huong gi?"), "impact analysis")
-
-    def test_detect_query_intent_business_flow(self):
-        self.assertEqual(rag.detect_query_intent("Luong xu ly login"), "domain/business flow")
+    def test_extract_tagged_payload_supports_tagged_inputs(self):
+        self.assertEqual(rag.extract_tagged_payload("<symbol>RequestService</symbol>", intent="call_flow"), ("symbol", "RequestService"))
+        self.assertEqual(rag.extract_tagged_payload("<file>auth_service.py</file>", intent="dependency"), ("file", "auth_service.py"))
+        self.assertEqual(rag.extract_tagged_payload("<module>auth</module>", intent="architecture_tour"), ("module", "auth"))
 
     def test_edge_types_per_intent(self):
         self.assertIn("calls", rag.get_graph_edge_types_for_intent("call flow"))
@@ -134,13 +136,13 @@ class Phase4PromptTests(unittest.TestCase):
             )
         ]
 
-        payload = rag.build_answer_payload("Ham login goi nhung ham nao?", docs)
+        payload = rag.build_answer_payload("/calls <symbol>login</symbol>", docs)
 
         self.assertIn("Intent:", payload["graph_evidence"])
         self.assertIn("calls", payload["graph_evidence"])
         self.assertIn("graph LR", payload["mermaid_graph"])
         self.assertIn("login", payload["context"])
-        self.assertEqual(payload["intent"], "call flow")
+        self.assertEqual(payload["intent"], "call_flow")
 
     def test_build_answer_payload_fetches_edges_for_doc_puid(self):
         docs = [
@@ -174,11 +176,71 @@ class Phase4PromptTests(unittest.TestCase):
                 "confidence": 0.8,
             }
         ]):
-            payload = rag.build_answer_payload("validate goi gi?", docs)
+            payload = rag.build_answer_payload("/calls <symbol>validate</symbol>", docs)
 
         self.assertIn("validate", payload["context"])
         self.assertIn("save", payload["graph_evidence"])
         self.assertIn("graph LR", payload["mermaid_graph"])
+
+
+class Phase4RetrievalTests(unittest.TestCase):
+    def setUp(self):
+        rag.st.session_state.clear()
+
+    def test_callsite_query_uses_call_graph_edges(self):
+        edge = {
+            "id": "edge-1",
+            "repo_name": "repo",
+            "filename": "src/client.py",
+            "lang": "python",
+            "edge_type": "calls",
+            "resolution_status": "resolved",
+            "confidence": 0.9,
+            "source_puid": "repo::src/client.py::function::handle",
+            "target_puid": "repo::src/request.py::class::RequestService",
+            "source_symbol": "handle",
+            "target_symbol": "RequestService",
+            "source_line": 42,
+            "target_line": 0,
+            "metadata": "callee=RequestService",
+        }
+        caller_node = {
+            "filename": "src/client.py",
+            "lang": "python",
+            "text": "def handle():\n    RequestService()",
+            "score": 1.0,
+            "start_line": 40,
+            "end_line": 45,
+            "is_test": False,
+            "node_type": "function",
+            "node_name": "handle",
+            "qualified_name": "handle",
+            "signature": "handle()",
+            "docstring": "",
+            "modifiers": "",
+            "export_status": "",
+            "source_span": "L40-L45",
+            "puid": "repo::src/client.py::function::handle",
+            "parent_puid": "",
+            "is_skeleton": False,
+            "repo_name": "repo",
+        }
+
+        with patch("rag.fetch_call_edges_by_symbol", return_value=[edge]) as edge_lookup, \
+             patch("rag.fetch_nodes", return_value=[caller_node]):
+            docs = rag.query_cocoindex_db(
+                "/callers <symbol>RequestService</symbol>",
+                top_k=5,
+                use_query_expansion=False,
+                use_hybrid=True,
+            )
+
+        edge_lookup.assert_called_once()
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0].metadata["node_name"], "handle")
+        self.assertEqual(docs[0].metadata["score_type"], "graph_callsite")
+        self.assertEqual(rag.st.session_state.last_query_intent, "call_flow_reverse")
+        self.assertEqual(rag.st.session_state.graph_seed_edges[0]["source_line"], 42)
 
 
 if __name__ == "__main__":

@@ -550,5 +550,17 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                                     language=meta.get("lang", ""),
                                 )
 
+                        if "impact_result" in st.session_state and st.session_state.impact_result:
+                            impact = st.session_state.impact_result
+                            with st.expander(f"🔍 [Debug] Impact Analysis ({impact.get('total_count', 0)} nodes)"):
+                                st.json(impact)
+                            del st.session_state["impact_result"]
+
+                        if "graph_seed_edges" in st.session_state and st.session_state.graph_seed_edges:
+                            edges = st.session_state.graph_seed_edges
+                            with st.expander(f"🕸️ [Debug] Graph Edges ({len(edges)})"):
+                                st.json(edges)
+                            del st.session_state["graph_seed_edges"]
+
                     except Exception as e:
                         st.error(f"❌ Lỗi LLM: {e}")
