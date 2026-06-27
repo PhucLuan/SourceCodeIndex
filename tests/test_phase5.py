@@ -228,8 +228,10 @@ class Phase5PayloadTests(unittest.TestCase):
                 "score": 1.0,
             }
         ]
-        impact_result = {
-            "affected_nodes": [
+        impact_analysis = {
+            "status": "ok",
+            "seed_candidates": seed_nodes,
+            "tree": [
                 {
                     "puid": "repo::a.py::function::handle",
                     "node_name": "handle",
@@ -240,13 +242,28 @@ class Phase5PayloadTests(unittest.TestCase):
                 }
             ],
             "edges": [
-                ("repo::a.py::function::handle", "repo::b.py::function::RequestService", "calls", 1)
+                {
+                    "source_puid": "repo::a.py::function::handle",
+                    "source_symbol": "handle",
+                    "source_file": "a.py",
+                    "source_line": 10,
+                    "target_puid": "repo::b.py::function::RequestService",
+                    "target_symbol": "RequestService",
+                    "target_file": "b.py",
+                    "target_line": 1,
+                    "edge_type": "calls",
+                    "resolution_status": "resolved",
+                    "confidence": 0.95,
+                    "metadata": "",
+                    "depth": 1,
+                    "path": ["repo::b.py::function::RequestService", "repo::a.py::function::handle"],
+                }
             ],
-            "max_depth_reached": False,
-            "total_count": 1,
+            "warnings": [],
+            "unsupported_change_types": [],
+            "confidence_summary": {"edge_count": 1, "min_confidence": 0.95, "avg_confidence": 0.95},
         }
-        with patch("rag.lookup_symbol", return_value=seed_nodes), \
-             patch("rag.run_impact_bfs", return_value=impact_result), \
+        with patch("rag.build_impact_analysis_result", return_value=impact_analysis), \
              patch("rag.fetch_nodes", return_value=[
                  {
                      "puid": "repo::a.py::function::handle",
@@ -268,5 +285,5 @@ class Phase5PayloadTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(docs), 1)
         self.assertEqual(rag.st.session_state.last_query_intent, "impact_analysis")
-        self.assertEqual(rag.st.session_state.impact_result["total_count"], 1)
+        self.assertEqual(rag.st.session_state.impact_analysis["status"], "ok")
         self.assertTrue(rag.st.session_state.graph_seed_edges)

@@ -27,7 +27,7 @@ from indexer_flow import (
     search as _search,
     search_per_repo,
 )
-from graph_traversal import impact_puids_to_nodes, run_impact_bfs
+from graph_traversal import build_impact_tree, impact_puids_to_nodes, render_impact_tree_text, run_impact_bfs
 
 
 SCORE_THRESHOLD = 0.3
@@ -66,6 +66,29 @@ COMMAND_PAYLOAD_TAGS: dict[str, str] = {
     "call_flow_reverse": "symbol",
     "dependency": "file",
     "semantic": "query",
+}
+
+# Phase 5A.1 - impact analysis accepts several explicit, type-discriminating tags.
+# Order matters: more specific tags are tried before the generic <symbol> fallback.
+IMPACT_TAG_PRIORITY: list[str] = [
+    "file",
+    "component",
+    "class",
+    "method",
+    "function",
+    "field",
+    "symbol",
+]
+
+# Maps a payload tag to the node_type values that are valid seeds for it.
+IMPACT_TAG_NODE_TYPES: dict[str, Optional[list[str]]] = {
+    "file": ["file"],
+    "component": ["module", "file"],
+    "class": ["class"],
+    "method": ["method", "function"],
+    "function": ["function"],
+    "field": ["field", "property", "attribute", "variable"],
+    "symbol": None,  # any node_type
 }
 
 
@@ -107,8 +130,11 @@ def extract_tagged_payload(raw_payload: str, intent: str | None = None) -> tuple
     if not text:
         return "", ""
 
-    expected_tag = COMMAND_PAYLOAD_TAGS.get(intent or "", "")
-    tag_names = [expected_tag] if expected_tag else list(dict.fromkeys(COMMAND_PAYLOAD_TAGS.values()))
+    if intent == "impact_analysis":
+        tag_names = list(IMPACT_TAG_PRIORITY)
+    else:
+        expected_tag = COMMAND_PAYLOAD_TAGS.get(intent or "", "")
+        tag_names = [expected_tag] if expected_tag else list(dict.fromkeys(COMMAND_PAYLOAD_TAGS.values()))
     for tag_name in tag_names:
         pattern = rf"^\s*<{tag_name}>\s*(.*?)\s*</{tag_name}>\s*$"
         match = re.match(pattern, text, flags=re.IGNORECASE | re.DOTALL)
@@ -352,6 +378,202 @@ def lookup_symbol(name: str, repo_name: Optional[str] = None, fuzzy: bool = Fals
         sys.stderr.write(f"[WARN] lookup_symbol failed: {ex}\n")
         return []
 
+def resolve_impact_seed_candidates(
+    payload_type: str,
+    payload_value: str,
+    repo_name: Optional[str] = None,
+) -> list[dict]:
+    """Phase 5A.1 - Resolve a tagged /impact payload into seed node candidates.
+
+    Unlike lookup_symbol()'s fuzzy top-N search, this enforces node_type
+    consistency with the payload tag (e.g. <method> must resolve to a
+    method/function node, not any node sharing the same name) and supports
+    "Class.member" qualified lookups for <method>/<field>.
+    """
+    value = (payload_value or "").strip()
+    if not value:
+        return []
+
+    node_types = IMPACT_TAG_NODE_TYPES.get(payload_type, None)
+
+    member_name = value
+    owner_name = ""
+    if payload_type in ("method", "field") and "." in value:
+        owner_name, member_name = value.rsplit(".", 1)
+
+    params: list[object] = []
+    clauses = ["is_skeleton = FALSE"]
+
+    if node_types:
+        params.append(node_types)
+        clauses.append(f"node_type = ANY(${len(params)})")
+
+    if repo_name:
+        params.append(repo_name)
+        clauses.append(f"repo_name = ${len(params)}")
+
+    if owner_name:
+        params.append(member_name)
+        member_idx = len(params)
+        params.append(f"%{owner_name}.{member_name}")
+        qualified_idx = len(params)
+        clauses.append(f"(node_name = ${member_idx} AND qualified_name LIKE ${qualified_idx})")
+    else:
+        params.append(value)
+        match_idx = len(params)
+        clauses.append(f"(node_name = ${match_idx} OR qualified_name = ${match_idx} OR filename = ${match_idx})")
+
+    query = f"""
+        SELECT puid, filename, repo_name, node_type, node_name, qualified_name, text,
+               signature, docstring, modifiers, export_status, lang, source_span,
+               1.0 AS score
+        FROM "{PG_SCHEMA}"."{TABLE_NAME}"
+        WHERE {" AND ".join(clauses)}
+        ORDER BY node_type ASC, node_name ASC, qualified_name ASC
+        LIMIT 15
+    """
+
+    async def _run() -> list[dict]:
+        async with await asyncpg.create_pool(DATABASE_URL) as pool:
+            rows = await pool.fetch(query, *params)
+            return [dict(r) for r in rows]
+
+    def _safe_run():
+        import asyncio
+        import threading
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if loop.is_running():
+            result = []
+            def thread_target():
+                new_loop = asyncio.new_event_loop()
+                result.extend(new_loop.run_until_complete(_run()))
+                new_loop.close()
+            t = threading.Thread(target=thread_target)
+            t.start()
+            t.join()
+            return result
+        else:
+            return loop.run_until_complete(_run())
+
+    try:
+        return _safe_run()
+    except Exception as ex:
+        sys.stderr.write(f"[WARN] resolve_impact_seed_candidates failed: {ex}\n")
+        return []
+
+
+# "Vet dau loang" (oil-spill ripple): dig through callers-of-callers until the
+# graph is exhausted, capped only as a safety bound against runaway graphs.
+IMPACT_MAX_RIPPLE_DEPTH = 12
+
+
+def build_impact_analysis_result(
+    payload_type: str,
+    payload_value: str,
+    repo_name: Optional[str] = None,
+    max_depth: int = IMPACT_MAX_RIPPLE_DEPTH,
+) -> dict[str, Any]:
+    """Phase 5A.5/5A.7 - Build the ImpactAnalysisResult contract for /impact.
+
+    status is one of: "ok", "ambiguous_seed", "no_seed", "insufficient_graph".
+    Only when status == "ok" should `tree`/`edges`/`impact_tree` be fed to the
+    LLM as trusted graph evidence; otherwise the caller must surface `warnings`
+    and avoid inferring beyond them.
+
+    The ripple expands by default until either the graph is exhausted (no more
+    resolved, high-confidence callers/importers found) or IMPACT_MAX_RIPPLE_DEPTH
+    hops are reached, matching the "vet dau loang" requirement: find direct
+    callers of the changed symbol, then callers of those callers, recursively.
+    """
+    result: dict[str, Any] = {
+        "status": "no_seed",
+        "seed_candidates": [],
+        "tree": [],
+        "impact_tree": [],
+        "edges": [],
+        "warnings": [],
+        "unsupported_change_types": [],
+        "confidence_summary": {},
+        "max_depth_reached": False,
+    }
+
+    effective_type = payload_type if payload_type in IMPACT_TAG_NODE_TYPES else "symbol"
+    fuzzy_fallback = effective_type == "symbol"
+
+    candidates = resolve_impact_seed_candidates(effective_type, payload_value, repo_name=repo_name)
+    if not candidates and fuzzy_fallback:
+        candidates = lookup_symbol(payload_value, repo_name=repo_name, fuzzy=True)
+
+    if not candidates:
+        result["warnings"].append(
+            f"No node found for {effective_type}:'{payload_value}'. Cannot start impact analysis."
+        )
+        return result
+
+    distinct_puids = {c.get("puid") for c in candidates if c.get("puid")}
+    if len(distinct_puids) > 1:
+        result["status"] = "ambiguous_seed"
+        result["seed_candidates"] = candidates[:10]
+        result["warnings"].append(
+            f"Multiple candidates match {effective_type}:'{payload_value}'. "
+            "Pick one explicitly (e.g. <method>Class.method</method>) to run impact analysis."
+        )
+        return result
+
+    if effective_type == "field" and not any(
+        (c.get("node_type") or "") in ("field", "property", "attribute", "variable") for c in candidates
+    ):
+        result["status"] = "insufficient_graph"
+        result["seed_candidates"] = candidates[:10]
+        result["unsupported_change_types"].append("field_read_write")
+        result["warnings"].append(
+            "Field/property read-write edges are not extracted yet; cannot compute field-level impact."
+        )
+        return result
+
+    start_puids = [c.get("puid") for c in candidates if c.get("puid")]
+    impact = run_impact_bfs(start_puids=start_puids, max_depth=max_depth, repo_name=repo_name, mode="strict")
+
+    result["seed_candidates"] = candidates[:10]
+    result["tree"] = impact.get("affected_nodes", [])
+    result["edges"] = impact.get("edges", [])
+    result["max_depth_reached"] = impact.get("max_depth_reached", False)
+
+    seed_info = {c.get("puid"): c for c in candidates if c.get("puid")}
+    result["impact_tree"] = build_impact_tree(start_puids, result["tree"], result["edges"], seed_info=seed_info)
+
+    if effective_type == "field":
+        result["unsupported_change_types"].append("field_read_write")
+
+    if not result["tree"]:
+        result["status"] = "insufficient_graph"
+        result["warnings"].append(
+            f"No resolved, high-confidence edges found pointing at {effective_type}:'{payload_value}'. "
+            "Graph evidence is insufficient for a confident impact answer."
+        )
+        return result
+
+    if result["max_depth_reached"]:
+        result["warnings"].append(
+            f"Ripple traversal hit the safety depth cap ({max_depth} hops); "
+            "there may be more indirect callers beyond what is shown."
+        )
+
+    confidences = [float(e.get("confidence") or 0.0) for e in result["edges"]]
+    result["confidence_summary"] = {
+        "edge_count": len(confidences),
+        "min_confidence": min(confidences) if confidences else 0.0,
+        "avg_confidence": (sum(confidences) / len(confidences)) if confidences else 0.0,
+    }
+    result["status"] = "ok"
+    return result
+
+
 def _enforce_soft_quota(merged: list[dict], top_k: int, max_per_repo: int) -> list[dict]:
     repo_counts: dict[str, int] = {}
     primary: list[dict] = []
@@ -418,32 +640,45 @@ def build_answer_payload(query_text: str, docs: list[Document]) -> dict[str, str
     payload_type, cleaned_payload = extract_tagged_payload(payload, intent=intent)
 
     if intent == "impact_analysis":
-        impact = getattr(st.session_state, "impact_result", None)
-        if impact:
-            lines = [f"[IMPACT ANALYSIS] Changed: {cleaned_payload or payload or query_text}"]
-            lines.append(
-                f"Total affected nodes: {impact.get('total_count', 0)}"
-                + (" (max depth reached)" if impact.get("max_depth_reached") else "")
-            )
-            for node in impact.get("affected_nodes", [])[:20]:
-                indent = "  " * int(node.get("depth", 0))
+        analysis = getattr(st.session_state, "impact_analysis", None)
+        if analysis:
+            status = analysis.get("status", "no_seed")
+            lines = [f"[IMPACT ANALYSIS] Changed: {cleaned_payload or payload or query_text}", f"Status: {status}"]
+
+            if status != "ok":
                 lines.append(
-                    f"{indent}depth={node.get('depth', 0)} "
-                    f"[{node.get('via_edge_type', '')}] {node.get('node_name', '')} — {node.get('filename', '')}"
+                    "Graph evidence is NOT reliable enough to answer confidently. "
+                    "Do not infer beyond what is listed below; ask for more specific input or say evidence is insufficient."
                 )
-            impact_edges = [
-                {
-                    "source_puid": src,
-                    "target_puid": tgt,
-                    "edge_type": edge_type,
-                    "resolution_status": "resolved",
+                for warning in analysis.get("warnings", []):
+                    lines.append(f"- WARNING: {warning}")
+                if analysis.get("seed_candidates"):
+                    lines.append("Seed candidates found (ambiguous, pick one explicitly):")
+                    for cand in analysis.get("seed_candidates", [])[:10]:
+                        lines.append(
+                            f"  - {cand.get('node_type', '')} {cand.get('qualified_name') or cand.get('node_name', '')} "
+                            f"({cand.get('filename', '')})"
+                        )
+                if analysis.get("unsupported_change_types"):
+                    lines.append(f"Unsupported change types: {', '.join(analysis['unsupported_change_types'])}")
+                return {
+                    "context": "\n\n".join(context_parts),
+                    "graph_evidence": "\n".join(lines),
+                    "mermaid_graph": "graph LR\n  A[Insufficient evidence]",
+                    "intent": intent,
                 }
-                for src, tgt, edge_type, _depth in impact.get("edges", [])
-            ]
+
+            lines.append(f"Total affected nodes: {len(analysis.get('tree', []))}")
+            if analysis.get("max_depth_reached"):
+                lines.append("(ripple traversal hit the safety depth cap — there may be more indirect callers)")
+            lines.append("")
+            lines.append("Ripple impact tree (root = changed symbol, each level = callers of the level above):")
+            lines.append(render_impact_tree_text(analysis.get("impact_tree", []), label="CHANGED"))
+            impact_edges = analysis.get("edges", [])
             graph_edges = impact_edges + graph_edges
             return {
                 "context": "\n\n".join(context_parts),
-                "graph_evidence": "\n".join(lines) + "\n" + _graph_edges_to_prompt_block(graph_edges),
+                "graph_evidence": "\n".join(lines) + "\n\n" + _graph_edges_to_prompt_block(graph_edges),
                 "mermaid_graph": _format_mermaid_from_edges(graph_edges),
                 "intent": intent,
             }
@@ -748,45 +983,43 @@ def query_cocoindex_db(
 
         if intent == "impact_analysis":
             active_repo = repo_names[0] if repo_names else None
-            seed_nodes = lookup_symbol(query_text, repo_name=active_repo, fuzzy=True)
-            if not seed_nodes and raw_payload != query_text:
-                seed_nodes = lookup_symbol(raw_payload, repo_name=active_repo, fuzzy=True)
-            start_puids = [n.get("puid", "") for n in seed_nodes[:3] if n.get("puid")]
-            start_symbols = [n.get("node_name", "") for n in seed_nodes[:3] if n.get("node_name")]
-            impact_result = run_impact_bfs(start_puids=start_puids, start_symbols=start_symbols, max_depth=3, repo_name=active_repo)
+            seed_value = query_text or raw_payload
+            impact_analysis = build_impact_analysis_result(
+                payload_type or "symbol", seed_value, repo_name=active_repo
+            )
             try:
-                st.session_state.impact_result = impact_result
+                st.session_state.impact_analysis = impact_analysis
+                # Legacy shape kept for older test/UI code paths.
+                st.session_state.impact_result = {
+                    "affected_nodes": impact_analysis.get("tree", []),
+                    "edges": impact_analysis.get("edges", []),
+                    "max_depth_reached": False,
+                    "total_count": len(impact_analysis.get("tree", [])),
+                }
             except Exception:
                 pass
 
-            affected_puids = [r.get("puid", "") for r in impact_result.get("affected_nodes", []) if r.get("puid")]
-            if affected_puids:
-                try:
-                    impacted_nodes = fetch_nodes(affected_puids)
-                except Exception as ex:
-                    sys.stderr.write(f"[WARN] fetch_nodes(impact) failed: {ex}\n")
-                    impacted_nodes = []
+            if impact_analysis.get("status") == "ok":
+                affected_puids = [r.get("puid", "") for r in impact_analysis.get("tree", []) if r.get("puid")]
+                if affected_puids:
+                    try:
+                        impacted_nodes = fetch_nodes(affected_puids)
+                    except Exception as ex:
+                        sys.stderr.write(f"[WARN] fetch_nodes(impact) failed: {ex}\n")
+                        impacted_nodes = []
 
-                depth_map = {r.get("puid", ""): r.get("depth", 0) for r in impact_result.get("affected_nodes", [])}
-                impacted_nodes.sort(key=lambda x: depth_map.get(x.get("puid", ""), 99))
-                for node in impacted_nodes:
-                    node["score"] = max(node.get("score", 0.0), 0.96)
-                    node["score_type"] = "graph_impact"
-                    node["query_intent"] = intent
-                    if node.get("puid") and node["puid"] not in seen_puids:
-                        all_results.append(node)
-                        seen_puids.add(node["puid"])
+                    depth_map = {r.get("puid", ""): r.get("depth", 0) for r in impact_analysis.get("tree", [])}
+                    impacted_nodes.sort(key=lambda x: depth_map.get(x.get("puid", ""), 99))
+                    for node in impacted_nodes:
+                        node["score"] = max(node.get("score", 0.0), 0.96)
+                        node["score_type"] = "graph_impact"
+                        node["query_intent"] = intent
+                        if node.get("puid") and node["puid"] not in seen_puids:
+                            all_results.append(node)
+                            seen_puids.add(node["puid"])
 
             try:
-                st.session_state.graph_seed_edges = [
-                    {
-                        "source_puid": src,
-                        "target_puid": tgt,
-                        "edge_type": edge_type,
-                        "resolution_status": "resolved",
-                    }
-                    for src, tgt, edge_type, _depth in impact_result.get("edges", [])
-                ]
+                st.session_state.graph_seed_edges = list(impact_analysis.get("edges", []))
             except Exception:
                 pass
 

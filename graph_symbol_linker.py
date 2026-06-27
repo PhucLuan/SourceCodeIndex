@@ -35,6 +35,13 @@ def _normalize_simple_name(symbol: str) -> str:
     raw = raw.split("::")[-1].strip()
     return raw
 
+
+def _extract_receiver_type(metadata: str) -> str:
+    for part in (metadata or "").split(";"):
+        if part.startswith("receiver_type="):
+            return part[len("receiver_type="):].strip()
+    return ""
+
 async def resolve_unresolved_edges() -> Dict[str, int]:
     """
     Main entry point for resolving unresolved/ambiguous edges in the database.
@@ -113,6 +120,21 @@ async def resolve_unresolved_edges() -> Dict[str, int]:
                 if edge["edge_type"] == "imports":
                     src = edge["source_puid"]
                     imports_by_file.setdefault(src, []).append(edge)
+
+            # Build interface/base-class -> implementing class index from textual
+            # implements/inherits target names (works even before those edges are
+            # themselves resolved). Used to disambiguate DI-style calls such as
+            # `_assignmentRepository.AddAsync()` where the field's declared type is
+            # an interface (IAssignmentRepository) implemented by exactly one class.
+            implementers_by_type: Dict[str, List[Dict[str, Any]]] = {}
+            for edge in edges:
+                if edge["edge_type"] in ("implements", "inherits"):
+                    type_name = _normalize_simple_name(edge["target_symbol"] or "")
+                    if not type_name:
+                        continue
+                    impl_node = nodes_by_puid.get(edge["source_puid"])
+                    if impl_node:
+                        implementers_by_type.setdefault(type_name, []).append(impl_node)
 
             # 4. Resolve imports first (Task 3.2)
             resolved_imports_count = 0
@@ -215,6 +237,40 @@ async def resolve_unresolved_edges() -> Dict[str, int]:
                         continue
 
                     # Candidate resolution strategies:
+                    # Strategy A0 (C# DI calls): if the call's receiver is a field whose
+                    # declared type is known (e.g. `_repo.AddAsync()` where
+                    # `_repo: IAssignmentRepository`), narrow candidates to methods
+                    # declared on classes that implement/inherit that type. This
+                    # disambiguates same-named methods across unrelated
+                    # repositories/services instead of falling back to a
+                    # repo-wide name match.
+                    if lang in ("csharp", "c_sharp") and edge_type == "calls":
+                        receiver_type = _extract_receiver_type(edge.get("metadata") or "")
+                        if receiver_type:
+                            candidate_classes = implementers_by_type.get(receiver_type, [])
+                            if not candidate_classes:
+                                candidate_classes = [
+                                    n for n in nodes_by_name.get(receiver_type, [])
+                                    if n["node_type"] == "class"
+                                ]
+                            method_matches = [
+                                n for n in nodes_by_puid.values()
+                                if n["node_name"] == simple_target
+                                and any(n["parent_puid"] == cls["puid"] for cls in candidate_classes)
+                            ]
+                            if len(method_matches) == 1:
+                                resolved_puid = method_matches[0]["puid"]
+                                new_status = "resolved"
+                                new_conf = 0.92
+                                resolved_calls_count += 1
+                                updates.append((resolved_puid, new_status, new_conf, edge_id))
+                                continue
+                            elif len(method_matches) > 1:
+                                new_status = "ambiguous"
+                                new_conf = 0.5
+                                updates.append((resolved_puid, new_status, new_conf, edge_id))
+                                continue
+
                     # Strategy A: Check if symbol is defined locally in the same file
                     local_candidates = []
                     if file_puid:

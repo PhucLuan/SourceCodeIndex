@@ -189,6 +189,38 @@ def _find_owner_chunk(infos: list[_ChunkInfo], line: int) -> Optional[_ChunkInfo
     return infos[0] if infos else None
 
 
+_CSHARP_FIELD_DECL = re.compile(
+    r"(?:private|protected|internal|public)\s+(?:readonly\s+)?"
+    r"([A-Za-z_]\w*)(?:<[^>]*>)?(?:\[\])?\s+"
+    r"(_?[A-Za-z]\w*)\s*;"
+)
+
+
+def _extract_csharp_field_types(text: str) -> dict[str, str]:
+    """Best-effort map of `field_name -> declared_type_name` for C# classes.
+
+    Used to resolve constructor-injected dependency calls like
+    `_assignmentRepository.AddAsync()` to the concrete/interface type so the
+    linker can disambiguate same-named methods across unrelated classes
+    (e.g. multiple repositories implementing AddAsync).
+    """
+    field_types: dict[str, str] = {}
+    for match in _CSHARP_FIELD_DECL.finditer(text):
+        type_name, field_name = match.group(1), match.group(2)
+        if type_name in {"return", "new", "var", "void"}:
+            continue
+        field_types[field_name] = type_name
+    return field_types
+
+
+def _csharp_receiver_type(callee: str, field_types: dict[str, str]) -> str:
+    if "." not in callee:
+        return ""
+    receiver = callee.rsplit(".", 1)[0].strip()
+    receiver = receiver.replace("this.", "").strip()
+    return field_types.get(receiver, "")
+
+
 def _call_node_types(lang: str) -> set[str]:
     lang = (lang or "").lower()
     if lang == "python":
@@ -201,7 +233,7 @@ def _call_node_types(lang: str) -> set[str]:
 
 
 def _call_callee_text(node, source_bytes: bytes) -> str:
-    for field_name in ("function", "expression", "callee", "constructor", "name", "object"):
+    for field_name in ("function", "expression", "callee", "constructor", "type", "name", "object"):
         child = node.child_by_field_name(field_name)
         if child:
             return _decode(source_bytes, child.start_byte, child.end_byte).strip()
@@ -231,12 +263,21 @@ def _collect_calls(
     call_types = _call_node_types(lang)
     edges: list[GraphEdge] = []
 
+    lang_lower = (lang or "").lower()
+    is_csharp = lang_lower in {"csharp", "c_sharp"}
+    field_types = _extract_csharp_field_types(text) if is_csharp else {}
+
     def visit(node):
         if node.type in call_types:
             callee = _call_callee_text(node, source_bytes)
             owner = _find_owner_chunk(infos, node.start_point.row + 1)
             if owner:
                 target_puid, status = _resolve_local_symbol(callee, by_name, by_qname)
+                metadata = f"callee={callee}"
+                if is_csharp:
+                    receiver_type = _csharp_receiver_type(callee, field_types)
+                    if receiver_type:
+                        metadata += f";receiver_type={receiver_type}"
                 edges.append(
                     _edge(
                         source_puid=owner.puid,
@@ -247,7 +288,7 @@ def _collect_calls(
                         target_symbol=callee,
                         source_line=node.start_point.row + 1,
                         target_line=0,
-                        metadata=f"callee={callee}",
+                        metadata=metadata,
                         confidence=0.85 if status == "resolved" else 0.55,
                         repo_name=repo_name,
                         filename=filename,
@@ -445,7 +486,9 @@ def _collect_imports_and_exports(
 
     elif lang in {"csharp", "c_sharp"}:
         for match in _C_SHARP_USING.finditer(text):
-            add_import(match.group(1).strip(), "external", "using")
+            # Let the symbol linker classify external vs. local namespaces later
+            # (it already checks EXTERNAL_PACKAGES and matches local files by name).
+            add_import(match.group(1).strip(), "unresolved", "using")
 
         # Public top-level classes/methods are treated as exported surface.
         for info in infos:

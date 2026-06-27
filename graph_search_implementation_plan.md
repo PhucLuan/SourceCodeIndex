@@ -16,16 +16,46 @@ Muc tieu truoc mat la cai thien search va response generation. Khong can UI ve g
 ### Hien trang hien co
 - `ast_chunker.py` da parse AST cho Python, C#, JavaScript, TypeScript, TSX, HTML, CSS.
 - `indexer_flow.py` da luu metadata tot cho node: `node_type`, `node_name`, `puid`, `parent_puid`, `is_skeleton`, `repo_name`.
+- `indexer_flow.py` da tao file node, persist graph edge table rieng, va chay `graph_symbol_linker.resolve_unresolved_edges()` sau khi index.
+- `graph_edge_extractor.py` da sinh cac edge co ban: `contains`, `imports`, `exports`, `calls`, `inherits`, `implements`.
+- `graph_symbol_linker.py` da co linker best-effort cho import/call/inherit/implements edge dua tren local scope, import target, va global unique symbol fallback.
+- `graph_traversal.py` da co `run_impact_bfs()` de reverse traversal tu seed symbol/PUID va tra ve affected nodes.
+- `rag.py` da co slash command `/impact`, `/calls`, `/callers`, `/deps`, `/tour`, graph evidence block, va Mermaid block dua vao prompt LLM.
 - `rag.py` da co query expansion, hybrid search, rerank, context enrichment qua `parent_puid`.
-- Search hien tai tot cho "tim doan code lien quan", nhung chua tot cho "tim quan he giua cac node".
+- Search hien tai da co graph-aware retrieval co ban, nhung do chinh xac impact/call graph van phu thuoc vao chat luong edge resolution.
 
 ### Gap can dong
-- Chua co edge table de luu `imports`, `calls`, `inherits`, `contains`, `exports`, `depends_on`.
-- Chua co symbol resolver de lien ket `target_symbol` sang node cu the.
-- Chua co explicit file node va namespace/kieu dinh danh on dinh cho graph.
-- `AstChunk.references` dang chua duoc dung de sinh relation.
-- Context enrichment hien tai chi dung `parent_puid`, chua the mo rong multi-hop graph.
-- Chua co search intent classifier de phan biet "semantic search" vs "graph traversal" vs "impact analysis".
+- Edge table va resolver da co, nhung chua co quality gate de chi dua `resolved`/high-confidence edge vao impact tree.
+- Cross-file symbol resolver con best-effort, de nham khi nhieu class/function trung ten, alias phuc tap, dynamic import, overload, generic method, hoac method call qua instance.
+- Impact BFS hien tai co fallback match `target_symbol` bang substring khi `target_puid` rong; cach nay huu ich cho prototype nhung chua du chinh xac lam evidence tin cay.
+- Chua co output contract rieng cho impact tree gom seed identity, impacted node, exact callsite/file/line, edge confidence, resolution status, ambiguity note, va path.
+- Chua co change-scope model: sua file/component, sua class, sua method/function, sua field/property/variable trong class dang bi xu ly gan giong nhau.
+- Chua co edge type `reads`, `writes`, `uses_type`, `instantiates`, `overrides`, `tested_by`; vi vay impact cua bien/property/interface/test coverage chua day du.
+- `AstChunk.references` dang chua duoc dung day du de sinh relation chi tiet cho variable/property/type references.
+- Context enrichment da co graph edges, nhung chua co strict graph-first orchestration cho moi graph intent; mot so query van bat dau bang semantic seed.
+- Chua co regression suite du manh de chung minh impact tree dung truoc khi dua vao LLM.
+
+### Ket luan hien tai ve impact analysis
+
+Ung dung **da co prototype impact analysis**:
+- Co `/impact <symbol>...</symbol>`.
+- Co lookup seed symbol.
+- Co reverse BFS tren `calls`, `imports`, `inherits`, `implements`, `contains`, `depends_on`.
+- Co dua affected nodes va graph evidence vao prompt LLM.
+
+Ung dung **chua dat muc "trusted impact tree"** nhu ky vong:
+- Chua dam bao moi affected node deu co exact resolved edge.
+- Chua dam bao moi impact co citation den dung callsite/property usage line.
+- Chua tach duoc semantic cua cac loai thay doi: component/file/class/function/method/field/variable.
+- Chua co ambiguity report bat buoc khi resolver khong chac.
+- Chua co test vang cho multi-hop impact va duplicate symbol scenarios.
+
+Impact tree chi duoc xem la dau vao chinh xac cho LLM khi:
+1. Seed symbol duoc resolve thanh dung PUID duy nhat, hoac user thay danh sach candidates neu ambiguous.
+2. Moi edge trong tree co `resolution_status`, `confidence`, `source_line`, `target_line` neu co.
+3. Impact traversal mac dinh chi dung `resolved` edge tren nguong confidence; unresolved/ambiguous/external chi duoc dua vao muc warning.
+4. Moi affected item co path ro rang: changed node -> inbound caller/importer/implementer -> next hop.
+5. Ket qua impact co the chay va assert bang test truoc khi LLM dien giai.
 
 ## Nguyen tac thiet ke
 
@@ -494,6 +524,178 @@ Dam bao app tra loi duoc cac cau hoi user hay dung trong thuc te.
 | "Neu doi ham nay thi anh huong file nao?" | Tra ve reverse graph list |
 | "Neu sua interface nay thi ai bi anh huong?" | Tra ve implementers/callers/importers |
 
+---
+
+## Phase 5A - Impact tree hardening before LLM
+
+### Muc tieu phase
+Bien `/impact` tu prototype reverse BFS thanh impact tree co the tin cay lam dau vao cho LLM.
+
+LLM chi duoc dien giai tren graph evidence da duoc tinh deterministic truoc. Neu graph khong du chac, response phai noi ro "chua du evidence" va hien ambiguity/unresolved notes.
+
+### Task 5A.1 - Define impact input contract
+**Lam gi**
+- Ho tro explicit payload:
+  - `<file>path</file>`
+  - `<component>Name</component>`
+  - `<class>Name</class>`
+  - `<method>Class.method</method>`
+  - `<function>Name</function>`
+  - `<field>Class.field</field>`
+  - `<symbol>Name</symbol>` fallback
+- Resolve payload thanh seed candidates truoc khi traversal.
+- Neu co nhieu candidate, khong chay BFS mac dinh; tra ve danh sach candidates de user/LLM biet ambiguity.
+
+**Expected outcome**
+- Impact analysis bat dau tu seed PUID dung, khong dua vao fuzzy top-3 im lang.
+
+**Test queries**
+| Query | Expected result |
+| --- | --- |
+| `/impact <class>AuthService</class>` | Tra ve 1 seed class hoac candidate list neu ambiguous |
+| `/impact <method>AuthService.validate</method>` | Tra ve dung method PUID, khong nham function cung ten |
+| `/impact <file>src/auth/service.py</file>` | Tra ve file node va contains descendants lam seed |
+
+### Task 5A.2 - Make impact traversal strict by default
+**Lam gi**
+- Them mode:
+  - `strict` mac dinh: chi traverse edge `resolved` va `confidence >= 0.80`.
+  - `exploratory`: co the include `ambiguous`/`unresolved` nhung nam trong warning section.
+- Loai bo substring fallback trong `run_impact_bfs()` khoi strict mode.
+- Giu `contains` theo huong phu hop:
+  - file/class change: expand descendants truoc, sau do reverse dependency tu descendants.
+  - method/function change: reverse callers/importers.
+  - field/property change: reverse reads/writes/uses neu edge da co; neu chua co thi report unsupported.
+
+**Expected outcome**
+- Tree impact khong bi them node sai vi match ten gan dung.
+
+**Test queries**
+| Query | Expected result |
+| --- | --- |
+| `/impact <function>validate</function>` khi co 2 validate | Khong chay BFS; tra ambiguous candidates |
+| `/impact <method>AuthService.validate</method>` | Chi tra callers/importers cua method do |
+| `/impact <class>AuthService</class>` | Include methods cua class roi inbound callers/importers |
+
+### Task 5A.3 - Add line-level evidence to impact edges
+**Lam gi**
+- Mo rong result edge cua impact tree tu tuple thanh object:
+  - source_puid, source_symbol, source_file, source_line
+  - target_puid, target_symbol, target_file, target_line
+  - edge_type, resolution_status, confidence, metadata
+  - depth, path
+- Join node table de lay filename/node_type/node_name cho source va target.
+- Trong prompt, hien exact callsite/import/inheritance line; neu khong co line thi ghi `line_unknown`.
+
+**Expected outcome**
+- Cau tra loi "sua X anh huong Y o dong nao" co evidence truc tiep.
+
+**Test queries**
+| Query | Expected result |
+| --- | --- |
+| `/impact <function>validateCredentials</function>` | Moi caller co source file + source_line |
+| `/impact <class>BaseController</class>` | Subclass/implementer co class declaration line |
+
+### Task 5A.4a - Resolve nested references and member chains
+**Lam gi**
+- Phan biet 2 loai "long cap":
+  - Graph traversal multi-hop: A -> B -> C theo cac edge da resolved.
+  - Code reference nesting/member chain: `controller.service.repo.save()`, `this.user.profile.email`, `module.submodule.Class.method`.
+- Extract member-chain reference tu AST:
+  - object/member/call chain
+  - optional chaining/null-safe access neu ngon ngu ho tro
+  - namespace/module-qualified symbol
+  - nested class/module/function reference
+- Resolve tung cap khi co du evidence:
+  - alias/import -> module/file
+  - variable/field -> inferred or declared type neu co
+  - member -> method/property cua type do
+- Neu mot cap trong chain khong resolve duoc, danh dau ca chain la partial/unresolved va khong dua vao strict impact tree.
+- Luu evidence:
+  - full reference text
+  - resolved prefix length
+  - unresolved segment
+  - source line/column neu co
+
+**Expected outcome**
+- He thong co the noi ro "tham chieu nay dung den method/property nao" thay vi chi match ten cuoi cung cua chain.
+
+**Test queries**
+| Query | Expected result |
+| --- | --- |
+| `/impact <method>Repository.save</method>` | Tim callsite `service.repo.save()` neu repo type resolved |
+| `/impact <field>User.profile.email</field>` | Tim nested read/write neu chain resolved |
+| `/impact <method>Auth.Client.login</method>` | Resolve namespace/module-qualified call neu import alias ro rang |
+
+### Task 5A.4 - Extract field/property/type usage edges
+**Lam gi**
+- Bo sung edge types:
+  - `reads`
+  - `writes`
+  - `uses_type`
+  - `instantiates`
+  - `overrides`
+  - `tested_by`
+- Dung AST/tree-sitter de phan biet:
+  - method call vs constructor call
+  - instance property read/write
+  - class/type annotation/reference
+  - override/implementation
+- Luu unresolved placeholder thay vi bo qua.
+
+**Expected outcome**
+- Sua bien/property trong class co the tim noi doc/ghi no, khong chi tim caller cua method.
+
+**Test queries**
+| Query | Expected result |
+| --- | --- |
+| `/impact <field>User.email</field>` | Tra noi read/write `email` kem line |
+| `/impact <class>UserDto</class>` | Tra `uses_type` tu controller/service/mapper |
+| `/impact <method>Child.save</method>` | Tra override/dispatch relationship neu co |
+
+### Task 5A.5 - Build impact result contract for LLM
+**Lam gi**
+- Tao `ImpactAnalysisResult` schema rieng:
+  - `status`: `ok`, `ambiguous_seed`, `no_seed`, `insufficient_graph`
+  - `seed_candidates`
+  - `tree`
+  - `edges`
+  - `warnings`
+  - `unsupported_change_types`
+  - `confidence_summary`
+- `rag.py` chi dua `tree` va `edges` vao `<graph_evidence>` khi `status=ok`.
+- Neu status khac `ok`, prompt phai yeu cau LLM noi ro can them thong tin nao, khong suy dien.
+
+**Expected outcome**
+- LLM khong nhan graph evidence "ban tin ban nghi"; no nhan ket qua da phan loai confidence.
+
+**Test queries**
+| Query | Expected result |
+| --- | --- |
+| `/impact <symbol>missingThing</symbol>` | `status=no_seed`, khong hallucinate |
+| `/impact <symbol>validate</symbol>` voi nhieu candidate | `status=ambiguous_seed` |
+| `/impact <field>User.email</field>` khi chua co reads/writes | `status=insufficient_graph` hoac warning unsupported |
+
+### Task 5A.6 - Add impact golden tests
+**Lam gi**
+- Tao fixture codebase nho co:
+  - duplicate function names
+  - class -> method -> caller chain
+  - imported function call
+  - inheritance/implements
+  - field read/write
+  - test file caller
+- Test extractor, linker, traversal, va prompt payload.
+
+**Expected outcome**
+- Co regression suite de chung minh impact tree dung truoc khi dua cho LLM.
+
+**Pass criteria**
+- 100% exact seed resolution voi fully qualified payload.
+- 0 false-positive trong strict impact tree tren fixture.
+- Moi edge strict co status `resolved`, confidence >= 0.80, va source line neu edge sinh tu source code.
+- Ambiguous/unresolved khong duoc tron vao `tree`; chi nam trong `warnings`.
+
 ### Task 5.5 - Guided tour generation
 **Lam gi**
 - Topological sort theo dependency.
@@ -620,6 +822,16 @@ Dam bao enhancements khong lam sua search hien tai va co regression suite ro ran
   - impact
   - guided tour
   - layer/domain
+
+### Phase 5A pass khi
+- `/impact` co input contract ro cho file/component/class/method/function/field/symbol.
+- Strict mode chi traverse `resolved` edge tren nguong confidence.
+- Ambiguous seed khong bi chon im lang; user/LLM nhan candidate list.
+- Impact tree tra file/line evidence cho moi callsite/import/inheritance/type usage neu co.
+- Nested/member-chain references duoc resolve theo tung cap; partial/unresolved chain chi vao warnings trong strict mode.
+- Field/property impact dung `reads`/`writes`/`uses_type` hoac report unsupported ro rang.
+- LLM prompt chi nhan `status=ok` graph tree lam evidence chinh; cac truong hop khong chac di vao warnings.
+- Impact golden tests pass, gom duplicate symbol va multi-hop reverse dependency.
 
 ### Phase 6 pass khi
 - Regression suite on dinh.
