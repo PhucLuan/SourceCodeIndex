@@ -27,7 +27,15 @@ from indexer_flow import (
     search as _search,
     search_per_repo,
 )
-from graph_traversal import build_impact_tree, impact_puids_to_nodes, render_impact_tree_text, run_impact_bfs
+from graph_traversal import (
+    build_impact_tree,
+    impact_puids_to_nodes,
+    render_impact_tree_text,
+    resolve_class_public_surface,
+    resolve_method_interface_seeds,
+    roll_up_to_owners,
+    run_impact_bfs,
+)
 
 
 SCORE_THRESHOLD = 0.3
@@ -506,14 +514,34 @@ def build_impact_analysis_result(
     fuzzy_fallback = effective_type == "symbol"
 
     candidates = resolve_impact_seed_candidates(effective_type, payload_value, repo_name=repo_name)
+    sys.stderr.write(
+        f"[IMPACT_SEED] type={effective_type} value='{payload_value}' repo_name={repo_name!r} "
+        f"-> {len(candidates)} exact-match candidate(s)\n"
+    )
+    if not candidates and repo_name:
+        # The repo filter may point at the wrong repo when multiple repos are
+        # indexed; retry without it before giving up.
+        candidates = resolve_impact_seed_candidates(effective_type, payload_value, repo_name=None)
+        sys.stderr.write(
+            f"[IMPACT_SEED] retry without repo filter -> {len(candidates)} candidate(s)\n"
+        )
     if not candidates and fuzzy_fallback:
         candidates = lookup_symbol(payload_value, repo_name=repo_name, fuzzy=True)
+        sys.stderr.write(
+            f"[IMPACT_SEED] fuzzy fallback -> {len(candidates)} candidate(s)\n"
+        )
 
     if not candidates:
         result["warnings"].append(
             f"No node found for {effective_type}:'{payload_value}'. Cannot start impact analysis."
         )
         return result
+
+    sys.stderr.write(
+        f"[IMPACT_SEED] resolved {len(candidates)} candidate(s): "
+        + ", ".join(c.get("qualified_name") or c.get("node_name") or c.get("puid", "?") for c in candidates[:10])
+        + "\n"
+    )
 
     distinct_puids = {c.get("puid") for c in candidates if c.get("puid")}
     if len(distinct_puids) > 1:
@@ -525,30 +553,90 @@ def build_impact_analysis_result(
         )
         return result
 
-    if effective_type == "field" and not any(
-        (c.get("node_type") or "") in ("field", "property", "attribute", "variable") for c in candidates
-    ):
-        result["status"] = "insufficient_graph"
-        result["seed_candidates"] = candidates[:10]
-        result["unsupported_change_types"].append("field_read_write")
-        result["warnings"].append(
-            "Field/property read-write edges are not extracted yet; cannot compute field-level impact."
+    # If the seed resolved to exactly one class/interface node (the user only
+    # named the class/service/component, not a specific member), a single
+    # puid is not a sufficient seed: any of its public members could be the
+    # one external callers actually invoke. Expand to the full public surface
+    # - including interface/base methods matched by name, since DI-routed
+    # callers record their 'calls' edge against the interface method's puid.
+    sole_candidate = candidates[0] if len(distinct_puids) == 1 else None
+    class_seed_members: list[dict] = []
+    if sole_candidate and (sole_candidate.get("node_type") or "") in ("class", "interface", "struct"):
+        class_seed_members = resolve_class_public_surface(sole_candidate["puid"])
+        sys.stderr.write(
+            f"[IMPACT_SEED] class '{sole_candidate.get('qualified_name') or sole_candidate.get('node_name')}' "
+            f"-> {len(class_seed_members)} public member seed(s): "
+            + ", ".join(f"{m.get('node_name')}({m.get('via')})" for m in class_seed_members[:15])
+            + "\n"
         )
-        return result
 
-    start_puids = [c.get("puid") for c in candidates if c.get("puid")]
-    impact = run_impact_bfs(start_puids=start_puids, max_depth=max_depth, repo_name=repo_name, mode="strict")
+    if class_seed_members:
+        start_puids = list(dict.fromkeys(
+            [sole_candidate["puid"]] + [m["puid"] for m in class_seed_members if m.get("puid")]
+        ))
+    else:
+        start_puids = [c.get("puid") for c in candidates if c.get("puid")]
+        # Same DI-via-interface problem, narrower case: the seed itself is one
+        # exact method (not a whole class), but its owning class may still
+        # implement an interface with a same-named method - callers typed
+        # against that interface record their 'calls' edge there, not here.
+        if sole_candidate and (sole_candidate.get("node_type") or "") in ("method", "function"):
+            interface_seeds = resolve_method_interface_seeds(
+                sole_candidate["puid"], sole_candidate.get("node_name", "")
+            )
+            if interface_seeds:
+                sys.stderr.write(
+                    f"[IMPACT_SEED] method '{sole_candidate.get('qualified_name') or sole_candidate.get('node_name')}' "
+                    f"-> also seeding {len(interface_seeds)} interface match(es): "
+                    + ", ".join(f"{m.get('node_name')}({m.get('via')})" for m in interface_seeds)
+                    + "\n"
+                )
+                class_seed_members = interface_seeds
+                start_puids = list(dict.fromkeys(start_puids + [m["puid"] for m in interface_seeds if m.get("puid")]))
 
-    result["seed_candidates"] = candidates[:10]
-    result["tree"] = impact.get("affected_nodes", [])
-    result["edges"] = impact.get("edges", [])
+    # The seed may have resolved in a different repo than the originally
+    # guessed `repo_name` (e.g. multi-repo index, wrong active_repo). Filter
+    # the BFS edge fetch by the seed's *actual* repo(s), not the stale guess,
+    # otherwise the edges touching the seed get filtered out and the BFS
+    # silently returns an empty tree.
+    seed_repo_names = {c.get("repo_name") for c in candidates if c.get("repo_name")}
+    effective_repo_name = next(iter(seed_repo_names)) if len(seed_repo_names) == 1 else None
+    if effective_repo_name != repo_name:
+        sys.stderr.write(
+            f"[IMPACT_BFS] overriding repo_name {repo_name!r} -> {effective_repo_name!r} "
+            f"based on resolved seed candidate(s)\n"
+        )
+
+    sys.stderr.write(f"[IMPACT_BFS] starting from {len(start_puids)} seed puid(s), max_depth={max_depth}\n")
+    impact = run_impact_bfs(start_puids=start_puids, max_depth=max_depth, repo_name=effective_repo_name, mode="strict")
+
+    raw_tree = impact.get("affected_nodes", [])
+    raw_edges = impact.get("edges", [])
     result["max_depth_reached"] = impact.get("max_depth_reached", False)
+    sys.stderr.write(
+        f"[IMPACT_BFS] traversal done: {len(raw_tree)} raw affected node(s), "
+        f"{len(raw_edges)} raw edge(s), max_depth_reached={result['max_depth_reached']}\n"
+    )
 
-    seed_info = {c.get("puid"): c for c in candidates if c.get("puid")}
-    result["impact_tree"] = build_impact_tree(start_puids, result["tree"], result["edges"], seed_info=seed_info)
+    # B2/B3: display the tree at component/service/class granularity, not raw
+    # method/field nodes - collapse everything up to its owning container.
+    known_node_info = {c.get("puid"): c for c in candidates if c.get("puid")}
+    owner_overrides: dict[str, str] = {}
+    for m in class_seed_members:
+        if m.get("puid"):
+            known_node_info[m["puid"]] = m
+        if m.get("puid") and m.get("owner_override"):
+            owner_overrides[m["puid"]] = m["owner_override"]
+    rolled = roll_up_to_owners(
+        start_puids, raw_tree, raw_edges, known_node_info=known_node_info, owner_overrides=owner_overrides
+    )
+    result["seed_candidates"] = candidates[:10]
+    result["tree"] = rolled["affected_nodes"]
+    result["edges"] = rolled["edges"]
 
-    if effective_type == "field":
-        result["unsupported_change_types"].append("field_read_write")
+    result["impact_tree"] = build_impact_tree(
+        rolled["start_puids"], result["tree"], result["edges"], seed_info=rolled["seed_info"]
+    )
 
     if not result["tree"]:
         result["status"] = "insufficient_graph"
@@ -622,13 +710,37 @@ def _format_mermaid_from_edges(edges: list[dict[str, Any]]) -> str:
         return text or "node"
 
     lines = ["graph LR"]
-    for edge in edges[:20]:
+    seen_pairs: set[tuple[str, str, str]] = set()
+    rendered = 0
+    # Cap rendered edges generously rather than at a flat 20: after the
+    # owner-level rollup the graph is already class/component-granularity, so
+    # a hub symbol used by many services (e.g. BaseRepository) can easily
+    # have 20+ distinct caller edges - clipping those silently dropped real
+    # callers from the diagram.
+    max_edges = 80
+    for edge in edges:
+        if rendered >= max_edges:
+            break
+        # Node label = class/component owner (source_node/target_node, set by
+        # roll_up_to_owners). source_symbol/target_symbol carry the specific
+        # method involved (e.g. "AssetController.AddAsync") - shown only as
+        # an edge label/metadata, not as a separate node.
         src = edge.get("source_node") or edge.get("source_symbol") or edge.get("source_puid") or "source"
         tgt = edge.get("target_node") or edge.get("target_symbol") or edge.get("target_puid") or "target"
         src_id = safe_label(src)
         tgt_id = safe_label(tgt)
         arrow = "-->" if edge.get("edge_type") != "contains" else "-.->"
-        lines.append(f'  {src_id}["{src}"] {arrow} {tgt_id}["{tgt}"]')
+        # Multiple call sites between the same pair (different lines) collapse
+        # to one arrow - the line-level detail still lives in graph_evidence.
+        pair_key = (src_id, tgt_id, arrow)
+        if pair_key in seen_pairs:
+            continue
+        seen_pairs.add(pair_key)
+        rendered += 1
+        caller_method = edge.get("source_symbol", "")
+        callee_method = edge.get("target_symbol", "")
+        label = f"|{caller_method} → {callee_method}|" if caller_method and callee_method else ""
+        lines.append(f'  {src_id}["{src}"] {arrow}{label} {tgt_id}["{tgt}"]')
     return "\n".join(lines)
 
 
@@ -1099,6 +1211,11 @@ def get_llm(llm_choice, model_name="gemma3:4b", api_key=None, ollama_host=None):
 
 
 def generate_answer_stream(query_text: str, docs: list[Document], llm):
+    # The Mermaid diagram is rendered deterministically by app.py from
+    # `payload["mermaid_graph"]` (see `_format_mermaid_from_edges`) - it is no
+    # longer placed in the prompt, since asking the LLM to redraw it from the
+    # textual graph evidence led to it inventing/oversimplifying diagrams
+    # (e.g. collapsing a real impact tree into "A[Insufficient evidence]").
     prompt_template = """\
 You are a senior software engineer helping analyze a source code base.
 
@@ -1110,14 +1227,10 @@ You are a senior software engineer helping analyze a source code base.
 {graph_evidence}
 </graph_evidence>
 
-<mermaid>
-{mermaid_graph}
-</mermaid>
-
 Answering rules:
 1. Use the code context and graph evidence together.
 2. When citing code, include file name and line numbers if available.
-3. If the query is graph-oriented, prefer edges, adjacency list, or Mermaid.
+3. Do not draw or describe a Mermaid/graph diagram yourself - the diagram is rendered separately from the graph evidence above.
 4. If the context is insufficient, say so clearly.
 5. Answer in Vietnamese if the question is in Vietnamese.
 
@@ -1126,6 +1239,10 @@ Question: {question}
 
     prompt = PromptTemplate.from_template(prompt_template)
     payload = build_answer_payload(query_text, docs)
+    try:
+        st.session_state.last_mermaid_graph = payload["mermaid_graph"]
+    except Exception:
+        pass
     chain = prompt | llm
 
     for chunk in chain.stream(
@@ -1133,7 +1250,6 @@ Question: {question}
             "context": payload["context"],
             "question": query_text,
             "graph_evidence": payload["graph_evidence"],
-            "mermaid_graph": payload["mermaid_graph"],
         }
     ):
         if hasattr(chunk, "content"):

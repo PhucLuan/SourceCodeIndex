@@ -11,6 +11,8 @@ GRAPH_EDGE_TYPES = (
     "inherits",
     "implements",
     "contains",
+    "reads",
+    "writes",
     "depends_on",
 )
 

@@ -1053,6 +1053,7 @@ async def _get_all_repo_names_async() -> list[str]:
                 f"SELECT DISTINCT repo_name"
                 f" FROM \"{PG_SCHEMA}\".\"{act_prof.table_name}\""
                 f" WHERE repo_name IS NOT NULL AND repo_name <> ''"
+                f" ORDER BY repo_name"
             )
     return [r["repo_name"] for r in rows]
 

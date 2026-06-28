@@ -10,6 +10,7 @@ Cải tiến:
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import json
 import os
 import shutil
@@ -27,6 +28,29 @@ st.set_page_config(page_title="Source Code Indexer", page_icon="🔍", layout="w
 SOURCES_FILE = "sources.json"
 WORKSPACE_DIR = "/tmp/workspace"
 PG_SCHEMA     = "public"
+
+_MERMAID_PLACEHOLDER_MARKERS = ("No graph evidence", "Insufficient evidence")
+
+
+def render_mermaid(mermaid_code: str) -> None:
+    """Render a Mermaid diagram deterministically (no LLM involved).
+
+    The diagram text comes straight from `rag._format_mermaid_from_edges`,
+    which builds it from the actual graph_edges/impact_tree data - this just
+    draws it. Skips rendering for the known "no evidence" placeholder text
+    since the answer text already explains that case.
+    """
+    if not mermaid_code or any(marker in mermaid_code for marker in _MERMAID_PLACEHOLDER_MARKERS):
+        return
+    html = f"""
+    <div class="mermaid">{mermaid_code}</div>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({{ startOnLoad: true, theme: "neutral" }});
+    </script>
+    """
+    line_count = mermaid_code.count("\n") + 1
+    components.html(html, height=max(150, 60 + line_count * 35), scrolling=True)
 
 # Lấy động table_name từ active profile
 _active_profile = load_active_profile()
@@ -468,6 +492,7 @@ if query := st.chat_input("Nhập câu hỏi về codebase..."):
                         stream_gen = generate_answer_stream(query, docs, llm)
                         response = st.write_stream(stream_gen)
                         st.session_state.messages.append({"role": "assistant", "content": response})
+                        render_mermaid(st.session_state.get("last_mermaid_graph", ""))
 
                         with st.expander(f"📎 {len(docs)} nguồn trích dẫn"):
                             for idx, d in enumerate(docs):

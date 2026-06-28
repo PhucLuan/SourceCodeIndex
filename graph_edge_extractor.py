@@ -302,6 +302,136 @@ def _collect_calls(
     return edges
 
 
+def _member_access_node_types(lang: str) -> set[str]:
+    lang = (lang or "").lower()
+    if lang in {"csharp", "c_sharp"}:
+        return {"member_access_expression"}
+    if lang in {"javascript", "js", "typescript", "ts", "tsx"}:
+        return {"member_expression"}
+    return set()
+
+
+def _is_call_callee(node) -> bool:
+    """True if `node` is the callee/function part of an invocation/object-creation
+    expression - already captured as a 'calls' edge by `_collect_calls`, so it
+    must be skipped here to avoid a redundant/incorrect reads edge (e.g. the
+    `dto.GetCode` in `dto.GetCode()` is a call, not a property read)."""
+    parent = node.parent
+    if not parent:
+        return False
+    if parent.type not in {"invocation_expression", "object_creation_expression", "call_expression", "new_expression"}:
+        return False
+    # NOTE: tree-sitter's Python binding does not guarantee `is` identity
+    # across separate child_by_field_name()/parent calls (each may return a
+    # fresh wrapper object for the same underlying node) - compare with `==`.
+    for field_name in ("function", "expression", "callee", "constructor", "type"):
+        child = parent.child_by_field_name(field_name)
+        if child is not None and child == node:
+            return True
+    return False
+
+
+def _is_write_target(node) -> bool:
+    """True if `node` is the left-hand side of an assignment (plain or compound)."""
+    parent = node.parent
+    if not parent or parent.type != "assignment_expression":
+        return False
+    left = parent.child_by_field_name("left")
+    return left is not None and left == node
+
+
+def _member_access_parts(node, lang: str, source_bytes: bytes) -> tuple[str, str]:
+    """Returns (receiver_text, member_name_text) for a member-access node."""
+    lang_lower = (lang or "").lower()
+    if lang_lower in {"csharp", "c_sharp"}:
+        obj = node.child_by_field_name("expression")
+        name = node.child_by_field_name("name")
+    else:
+        obj = node.child_by_field_name("object")
+        name = node.child_by_field_name("property")
+    if obj is None or name is None:
+        # Fallback if the grammar's field names differ from expected: the
+        # member name is typically the last named child, the receiver the rest.
+        named_children = [c for c in node.children if c.is_named]
+        if len(named_children) >= 2:
+            obj = obj or named_children[0]
+            name = name or named_children[-1]
+    obj_text = _decode(source_bytes, obj.start_byte, obj.end_byte).strip() if obj else ""
+    name_text = _decode(source_bytes, name.start_byte, name.end_byte).strip() if name else ""
+    return obj_text, name_text
+
+
+def _collect_member_access(
+    text: str,
+    lang: str,
+    infos: list[_ChunkInfo],
+    by_name: dict[str, list[_ChunkInfo]],
+    by_qname: dict[str, _ChunkInfo],
+    filename: str,
+    repo_name: str,
+) -> list[GraphEdge]:
+    """Find All References, "Code"-style: property/field reads & writes.
+
+    `_collect_calls` only captures method invocations - a plain `dto.Code` or
+    `dto.Code = x` member access (no call parens) is invisible to it. Without
+    this, /impact on a DTO-style class with no methods (just properties) finds
+    nothing, even though it's read/written everywhere.
+    """
+    from ast_chunker import parsers
+
+    parser = parsers.get(lang)
+    if not parser:
+        return []
+
+    member_types = _member_access_node_types(lang)
+    if not member_types:
+        return []
+
+    source_bytes = text.encode("utf-8")
+    tree = parser.parse(source_bytes)
+    edges: list[GraphEdge] = []
+
+    lang_lower = (lang or "").lower()
+    is_csharp = lang_lower in {"csharp", "c_sharp"}
+    field_types = _extract_csharp_field_types(text) if is_csharp else {}
+
+    def visit(node):
+        if node.type in member_types and not _is_call_callee(node):
+            receiver_text, member_name = _member_access_parts(node, lang, source_bytes)
+            if member_name:
+                owner = _find_owner_chunk(infos, node.start_point.row + 1)
+                if owner:
+                    target_puid, status = _resolve_local_symbol(member_name, by_name, by_qname)
+                    edge_type = "writes" if _is_write_target(node) else "reads"
+                    metadata = f"receiver={receiver_text};member={member_name}"
+                    if is_csharp:
+                        receiver_type = _csharp_receiver_type(f"{receiver_text}.{member_name}", field_types)
+                        if receiver_type:
+                            metadata += f";receiver_type={receiver_type}"
+                    edges.append(
+                        _edge(
+                            source_puid=owner.puid,
+                            target_puid=target_puid,
+                            edge_type=edge_type,
+                            resolution_status=status,
+                            source_symbol=owner.qualified_name or owner.node_name,
+                            target_symbol=member_name,
+                            source_line=node.start_point.row + 1,
+                            target_line=0,
+                            metadata=metadata,
+                            confidence=0.8 if status == "resolved" else 0.5,
+                            repo_name=repo_name,
+                            filename=filename,
+                            lang=lang,
+                        )
+                    )
+        for child in node.children:
+            visit(child)
+
+    visit(tree.root_node)
+    return edges
+
+
 def _collect_contains(
     infos: list[_ChunkInfo],
     filename: str,
@@ -548,6 +678,17 @@ def extract_graph_edges(
             repo_name=repo_name,
         )
     )
+    edges.extend(
+        _collect_member_access(
+            text=text,
+            lang=lang,
+            infos=infos,
+            by_name=by_name,
+            by_qname=by_qname,
+            filename=filepath,
+            repo_name=repo_name,
+        )
+    )
 
     # Inheritance / implementation edges.
     lang_lower = (lang or "").lower()
@@ -582,7 +723,7 @@ def extract_graph_edges(
                     )
         elif lang_lower in {"javascript", "js", "typescript", "ts", "tsx"}:
             m_extends = re.search(
-                rf"class\s+{re.escape(info.node_name)}\s+extends\s+([A-Za-z_][\w\.]*)",
+                rf"class\s+{re.escape(info.node_name)}\s*(?:<[^>]*>)?\s+extends\s+([A-Za-z_][\w\.]*)",
                 text,
                 re.MULTILINE,
             )
@@ -631,8 +772,11 @@ def extract_graph_edges(
                         )
                     )
         elif lang_lower in {"csharp", "c_sharp"}:
+            # Generic classes (e.g. `class BaseRepository<T> : IBaseRepository<T>`)
+            # put the type-parameter list between the class name and the base
+            # list's colon - allow an optional single-level `<...>` there.
             m = re.search(
-                rf"class\s+{re.escape(info.node_name)}\s*:\s*([^\{{]+)",
+                rf"class\s+{re.escape(info.node_name)}\s*(?:<[^>]*>)?\s*:\s*([^\{{]+)",
                 text,
                 re.MULTILINE | re.DOTALL,
             )

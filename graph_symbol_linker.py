@@ -197,7 +197,7 @@ async def resolve_unresolved_edges() -> Dict[str, int]:
                         src = edge["source_puid"]
                         imports_by_file.setdefault(src, []).append(edge)
 
-            # 5. Resolve calls, inherits, implements (Task 3.3)
+            # 5. Resolve calls, inherits, implements, reads, writes (Task 3.3 + property refs)
             updates.clear()
             for edge in edges:
                 edge_id = edge["id"]
@@ -207,7 +207,7 @@ async def resolve_unresolved_edges() -> Dict[str, int]:
                 source_puid = edge["source_puid"]
                 lang = (edge["lang"] or "").lower()
 
-                if edge_type in ("calls", "inherits", "implements") and status in ("unresolved", "ambiguous"):
+                if edge_type in ("calls", "inherits", "implements", "reads", "writes") and status in ("unresolved", "ambiguous"):
                     resolved_puid = ""
                     new_status = "unresolved"
                     new_conf = 0.3
@@ -237,14 +237,14 @@ async def resolve_unresolved_edges() -> Dict[str, int]:
                         continue
 
                     # Candidate resolution strategies:
-                    # Strategy A0 (C# DI calls): if the call's receiver is a field whose
-                    # declared type is known (e.g. `_repo.AddAsync()` where
-                    # `_repo: IAssignmentRepository`), narrow candidates to methods
-                    # declared on classes that implement/inherit that type. This
-                    # disambiguates same-named methods across unrelated
-                    # repositories/services instead of falling back to a
-                    # repo-wide name match.
-                    if lang in ("csharp", "c_sharp") and edge_type == "calls":
+                    # Strategy A0 (C# DI calls/reads/writes): if the receiver is a
+                    # field whose declared type is known (e.g. `_repo.AddAsync()` or
+                    # `_dto.Code` where `_repo: IAssignmentRepository`), narrow
+                    # candidates to members declared on classes that implement/
+                    # inherit that type. This disambiguates same-named
+                    # methods/properties across unrelated repositories/services/DTOs
+                    # instead of falling back to a repo-wide name match.
+                    if lang in ("csharp", "c_sharp") and edge_type in ("calls", "reads", "writes"):
                         receiver_type = _extract_receiver_type(edge.get("metadata") or "")
                         if receiver_type:
                             candidate_classes = implementers_by_type.get(receiver_type, [])

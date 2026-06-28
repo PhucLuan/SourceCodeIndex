@@ -152,15 +152,45 @@ class ImpactAnalysisResultContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "ambiguous_seed")
         self.assertEqual(len(result["seed_candidates"]), 2)
 
-    def test_field_without_field_nodes_is_insufficient_graph(self):
+    def test_field_seed_resolves_via_reads_writes_edges(self):
+        # Property/field read-write edges are now extracted (member-access
+        # tracking) - a <field> seed should reach "ok" via real 'reads'/
+        # 'writes' evidence instead of the old hardcoded "not extracted yet"
+        # rejection, and must not be flagged as an unsupported change type.
         candidates = [
-            {"puid": "repo::a.py::class::User", "node_type": "class", "node_name": "User", "filename": "a.py"},
+            {"puid": "repo::a.py::class::User::email", "node_type": "field", "node_name": "email", "filename": "a.py"},
         ]
-        with patch("rag.resolve_impact_seed_candidates", return_value=candidates):
+        bfs_result = {
+            "affected_nodes": [
+                {"puid": "repo::b.py::function::format_user", "node_name": "format_user", "filename": "b.py", "depth": 1, "via_edge_type": "reads", "path": []}
+            ],
+            "edges": [
+                {
+                    "source_puid": "repo::b.py::function::format_user",
+                    "source_symbol": "format_user",
+                    "source_file": "b.py",
+                    "source_line": 5,
+                    "target_puid": "repo::a.py::class::User::email",
+                    "target_symbol": "email",
+                    "target_file": "a.py",
+                    "target_line": 1,
+                    "edge_type": "reads",
+                    "resolution_status": "resolved",
+                    "confidence": 0.8,
+                    "metadata": "",
+                    "depth": 1,
+                    "path": [],
+                }
+            ],
+            "max_depth_reached": False,
+            "total_count": 1,
+        }
+        with patch("rag.resolve_impact_seed_candidates", return_value=candidates), \
+             patch("rag.run_impact_bfs", return_value=bfs_result):
             result = rag.build_impact_analysis_result("field", "User.email")
 
-        self.assertEqual(result["status"], "insufficient_graph")
-        self.assertIn("field_read_write", result["unsupported_change_types"])
+        self.assertEqual(result["status"], "ok")
+        self.assertNotIn("field_read_write", result["unsupported_change_types"])
 
     def test_ok_status_with_single_resolved_seed(self):
         seed = [{"puid": "repo::b.py::function::validate", "node_type": "function", "node_name": "validate", "filename": "b.py"}]
